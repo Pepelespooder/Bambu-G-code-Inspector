@@ -5,10 +5,14 @@ from __future__ import annotations
 USAGE = (
     "G-code Inspector\n\n"
     "Usage:\n"
-    "  python gcode_inspector.py <path-to-file.gcode> [--filament-diameter 1.75] [--plot] [--interactive]\n\n"
+    "  python gcode_inspector.py <path-to-file.gcode> [--filament-diameter 1.75] [--plot] [--sideview] [--flow] [--interactive] [--e-per-mm] [--cooling]\n\n"
     "Notes:\n"
     "  - Drag-and-drop onto this .py or .bat is supported.\n"
     "  - Use --plot to save a per-layer metrics PNG.\n"
+    "  - Use --sideview to save a sideview (layers vs. path) PNG with speeds/travel coloring.\n"
+    "  - Use --flow to save volumetric flow (mm^3/s) over time with safe-limit flags.\n"
+    "  - Use --e-per-mm to save Extrusion-per-distance (E/mm) plot with rolling std-dev.\n"
+    "  - Use --cooling to save a cooling plot (fan vs layer time) highlighting low-fan short layers.\n"
 )
 
 import math
@@ -53,6 +57,13 @@ BAMBU_LAYER_PROGRESS_RE = re.compile(r"layer\s+num/total_layer_count\s*:\s*(\d+)
 
 # Sentinel to ensure we only try to auto-install matplotlib once per process
 _MPL_TRIED_INSTALL = False
+
+# Corner-stress defaults
+CS_ANGLE_MIN_DEG = 35.0       # minimum corner angle to consider
+CS_SEG_MIN_MM = 1.0           # minimum segment length for both sides
+CS_RADIUS_FLOOR_MM = 1.2      # minimum effective radius for heuristic
+CS_STRESS_MIN = 0.15          # ignore tiny stress values to reduce noise
+CS_MARGIN = 1.35              # safety margin when comparing incoming vs. limit
 
 # Printer model detection patterns
 PRN_PATS: List[Tuple[re.Pattern[str], str]] = [
@@ -227,6 +238,21 @@ class HeuristicStats:
     # Per-layer aggregates
     layer_move_mm: Dict[int, float] = field(default_factory=dict)
     layer_time_s: Dict[int, float] = field(default_factory=dict)
+    # Time-weighted fan per layer (sum of fan*seg_time), to compute avg fan% per layer
+    layer_fan_time_255: Dict[int, float] = field(default_factory=dict)
+    # Per-segment extrusion per distance samples (E/mm)
+    e_per_mm_samples: List[float] = field(default_factory=list)
+    # Optional layer index alongside E/mm samples
+    e_per_mm_layers: List[Optional[int]] = field(default_factory=list)
+    # Current/last seen dynamics (global, not only first layer)
+    accel_print_current: Optional[float] = None  # from M204 P/S
+    accel_travel_current: Optional[float] = None  # from M204 T/S
+    jerk_x_current: Optional[float] = None  # from M205 X
+    jerk_y_current: Optional[float] = None  # from M205 Y
+    junction_dev_current: Optional[float] = None  # from M205 J (Marlin JD)
+    klipper_scv_current: Optional[float] = None  # from SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY
+    # Corner stress samples: (time_s, stress_index, angle_deg, v_in, v_limit, r_est)
+    corner_samples: List[Tuple[float, float, float, float, Optional[float], float]] = field(default_factory=list)
 
 
 @dataclass
@@ -246,6 +272,12 @@ class GcodeSummary:
     flags: List[str]
     notes: List[str]
     printer_model: Optional[str] = None
+    # Filament branding
+    filament_brand: Optional[str] = None
+    filament_name: Optional[str] = None
+    filament_color: Optional[str] = None
+    # Filament Max Volumetric Speed (mm^3/s) if provided/overridden
+    filament_mvs_mm3_s: Optional[float] = None
     # Additional insights
     heuristics: Optional[HeuristicStats] = None
     extrusion: Optional[ExtrusionStats] = None
@@ -271,9 +303,10 @@ class GcodeSummary:
 
 
 class GcodeInspector:
-    def __init__(self, filament_diameter_mm: float = 1.75, printer_override: Optional[str] = None):
+    def __init__(self, filament_diameter_mm: float = 1.75, printer_override: Optional[str] = None, flow_limit_override_mm3_s: Optional[float] = None):
         self.filament_diameter_mm = filament_diameter_mm
         self.printer_override = printer_override
+        self.flow_limit_override_mm3_s = flow_limit_override_mm3_s
 
     def inspect(self, lines: Iterable[str], filename: Optional[Path] = None) -> GcodeSummary:
         temps = TempProfile()
@@ -309,6 +342,10 @@ class GcodeInspector:
         header_kv: Dict[str, object] = {}
         commented_material: Optional[str] = None
         commented_diameter: Optional[float] = None
+        # Filament branding/name/color hints
+        commented_brand_guess: Optional[str] = None
+        commented_name_hint: Optional[str] = None
+        commented_color_hint: Optional[str] = None
 
         in_header = False
         # Layer tracking
@@ -452,6 +489,21 @@ class GcodeInspector:
                 m = MATERIAL_RE.search(comment)
                 if m and not commented_material:
                     commented_material = m.group(1).upper()
+                # Brand/name/color hints from common keys
+                for key in ("filament_brand", "brand", "vendor", "manufacturer"):
+                    if key in comment_kv and not commented_brand_guess:
+                        commented_brand_guess = comment_kv.get(key)
+                for key in ("filament_name", "name", "filament_fullname"):
+                    if key in comment_kv and not commented_name_hint:
+                        commented_name_hint = comment_kv.get(key)
+                for key in ("filament_color", "color", "colour"):
+                    if key in comment_kv and not commented_color_hint:
+                        commented_color_hint = comment_kv.get(key)
+                # Free-text brand token search
+                if not commented_brand_guess:
+                    brand = self._detect_filament_brand((comment or "") + " " + (code or ""))
+                    if brand:
+                        commented_brand_guess = brand
                 # Filament diameter hints
                 m2 = DIAMETER_RE.search(comment)
                 if m2 and not commented_diameter:
@@ -558,6 +610,13 @@ class GcodeInspector:
                     s = parse_word(code, "S")
                     p = parse_word(code, "P")
                     t = parse_word(code, "T")
+                    # Update global current values
+                    val_p_glob = p or s
+                    val_t_glob = t or s
+                    if val_p_glob is not None:
+                        heur.accel_print_current = val_p_glob
+                    if val_t_glob is not None:
+                        heur.accel_travel_current = val_t_glob
                     if in_first_layer:
                         val_p = p or s
                         val_t = t or s
@@ -573,6 +632,16 @@ class GcodeInspector:
                                 heur.fl_accel_travel_max = max(heur.fl_accel_travel_max, val_t)
                 elif word0 == "M205":
                     # Jerk settings: X/Y/Z/E values in mm/s on many firmwares
+                    # Also, J may represent Junction Deviation (mm) on some firmwares
+                    jparam = parse_word(code, "J")
+                    if jparam is not None:
+                        heur.junction_dev_current = jparam
+                    jx_g = parse_word(code, "X")
+                    jy_g = parse_word(code, "Y")
+                    if jx_g is not None:
+                        heur.jerk_x_current = jx_g
+                    if jy_g is not None:
+                        heur.jerk_y_current = jy_g
                     if in_first_layer:
                         jx = parse_word(code, "X")
                         jy = parse_word(code, "Y")
@@ -664,6 +733,8 @@ class GcodeInspector:
 
                 # Compute XY travel distance for this move
                 xy_dist = 0.0
+                dx = 0.0
+                dy = 0.0
                 if x is not None or y is not None:
                     # Get current/next XY based on positioning mode
                     nx = last_x if last_x is not None else 0.0
@@ -707,6 +778,89 @@ class GcodeInspector:
                         extrusion.positive_extrusions += 1
                         last_e_move_was_extrude = True
                         retracted_since_last_extrude = False
+                        # Track E/mm for this segment when XY distance is meaningful
+                        # Ignore very short segments to avoid noisy division and purge/wipe artifacts
+                        if xy_dist is not None and xy_dist > 0.2:
+                            try:
+                                heur.e_per_mm_samples.append(delta_e / xy_dist)
+                                heur.e_per_mm_layers.append(current_layer_index)
+                            except Exception:
+                                pass
+                        # Corner stress estimation: compare this segment to previous extruding segment
+                        # Requires previous extruding vector and speeds
+                        try:
+                            speed_mms = (last_feed / 60.0) if last_feed else None
+                        except Exception:
+                            speed_mms = None
+                        if speed_mms and xy_dist > 0.3:
+                            # Initialize persistent previous-segment state container lazily on the instance
+                            if not hasattr(self, "_prev_extr"):
+                                self._prev_extr = {"vec": None, "len": 0.0, "speed": None, "t_end": 0.0}
+                            prev = self._prev_extr
+                            pv = prev.get("vec")
+                            pl = float(prev.get("len") or 0.0)
+                            pin = prev.get("speed")
+                            t_prev_end = float(prev.get("t_end") or 0.0)
+                            # Compute angle with previous vector
+                            if pv and pin and pl > CS_SEG_MIN_MM and xy_dist > CS_SEG_MIN_MM:
+                                vx0, vy0 = pv
+                                v0_len = math.hypot(vx0, vy0)
+                                v1_len = math.hypot(dx, dy)
+                                if v0_len > 0 and v1_len > 0:
+                                    dot = vx0 * dx + vy0 * dy
+                                    cos_t = max(-1.0, min(1.0, dot / (v0_len * v1_len)))
+                                    theta = math.acos(cos_t)
+                                    # Skip small direction changes; require a more pronounced corner
+                                    if theta > math.radians(CS_ANGLE_MIN_DEG):
+                                        # Corner radius estimate (heuristic)
+                                        # Use a slightly larger floor to reflect slicer corner smoothing/arc fitting
+                                        r_est = max(CS_RADIUS_FLOOR_MM, min(pl, v1_len) * abs(math.sin(theta / 2.0)))
+                                        # Limits from accel and Klipper SCV; ignore Marlin jerk (unreliable for this calc)
+                                        a = heur.accel_print_current or 2000.0
+                                        v_acc = math.sqrt(max(0.0, a * r_est))
+                                        v_scv = heur.klipper_scv_current if heur.klipper_scv_current is not None else None
+                                        v_jd = None
+                                        if heur.junction_dev_current is not None and heur.junction_dev_current > 0:
+                                            # Coarse cap using JD and accel; do not scale by angle to avoid over-restricting
+                                            v_jd = math.sqrt(max(0.0, a * heur.junction_dev_current))
+                                        # Aggregate corner limit
+                                        v_candidates = [v for v in (v_acc, v_scv, v_jd) if v is not None and v > 0]
+                                        v_limit = min(v_candidates) if v_candidates else None
+                                        # Cap incoming speed by reachable speed given segment lengths and accel
+                                        # If the segments are short, the toolhead cannot maintain the commanded speed
+                                        v_reach_prev = math.sqrt(max(0.0, 2.0 * a * pl))
+                                        v_reach_cur = math.sqrt(max(0.0, 2.0 * a * v1_len))
+                                        v_in = min(float(pin), v_reach_prev, v_reach_cur)
+                                        angle_factor = abs(math.sin(theta / 2.0))
+                                        margin = CS_MARGIN  # conservative margin to reduce false positives
+                                        if v_limit is not None and v_limit > 0 and v_in > 0:
+                                            stress = (v_in / (v_limit * margin)) * angle_factor
+                                        else:
+                                            # Fallback: acceleration-only heuristic
+                                            denom = max(1e-3, v_acc)
+                                            stress = (v_in / (denom * margin)) * angle_factor
+                                        # Suppress very low stress values to reduce noise
+                                        if stress >= CS_STRESS_MIN:
+                                            heur.corner_samples.append((t_prev_end, float(stress), math.degrees(theta), v_in, v_limit, r_est))
+                            # Update previous segment state to current
+                            # We need segment time to update end-time; estimate using XY and Z contributions
+                            seg_time = 0.0
+                            if last_feed is not None and last_feed > 0:
+                                speed_cur = last_feed / 60.0
+                                if speed_cur > 0:
+                                    if xy_dist > 0.0:
+                                        seg_time += xy_dist / speed_cur
+                                    if z_dist > 0.0:
+                                        seg_time += z_dist / speed_cur
+                            # Accumulate end time based on a running counter on self
+                            if not hasattr(self, "_cum_time_s"):
+                                self._cum_time_s = 0.0
+                            # Previous end time already stored in prev["t_end"]
+                            # Now set new prev to current
+                            t_end = float(self._cum_time_s) + float(seg_time)
+                            self._prev_extr = {"vec": (dx, dy), "len": xy_dist, "speed": speed_mms, "t_end": t_end}
+                            # Update cumulative timer
+                            self._cum_time_s = t_end
                         # Volumetric flow sample if we can compute time from feed and travel length
                         # Ignore micro segments to avoid inflated rates from calibration/purge/wipes
                         if last_feed and xy_dist is not None and xy_dist > 0.5 and delta_e >= 0.05:
@@ -717,6 +871,18 @@ class GcodeInspector:
                     else:
                         # Pure travel or zero E change
                         last_e_move_was_extrude = False
+                        # Update cumulative time for travels as well
+                        # Estimate time similarly to extrusion segments
+                        if last_feed is not None and last_feed > 0:
+                            speed_cur = last_feed / 60.0
+                            seg_time = 0.0
+                            if xy_dist > 0.0:
+                                seg_time += xy_dist / speed_cur
+                            if z_dist > 0.0:
+                                seg_time += z_dist / speed_cur
+                            if not hasattr(self, "_cum_time_s"):
+                                self._cum_time_s = 0.0
+                            self._cum_time_s += seg_time
 
                 # Feed rate classification for move
                 # For extrusion max speed stats, ignore micro-extrusions with tiny XY distance
@@ -752,18 +918,21 @@ class GcodeInspector:
 
                 # Per-layer aggregates (distance and time)
                 if in_print_phase and current_layer_index is not None:
-                    if xy_dist > 0.0:
+                    # Ignore micro jitters to reduce noise in per-layer movement
+                    if xy_dist >= 0.1:
                         heur.layer_move_mm[current_layer_index] = heur.layer_move_mm.get(current_layer_index, 0.0) + xy_dist
                     if last_feed is not None:
                         speed_mms = last_feed / 60.0
                         if speed_mms > 0.0:
                             seg_t = 0.0
-                            if xy_dist > 0.0:
+                            if xy_dist >= 0.1:
                                 seg_t += xy_dist / speed_mms
                             if z_dist > 0.0:
                                 seg_t += z_dist / speed_mms
                             if seg_t > 0.0:
                                 heur.layer_time_s[current_layer_index] = heur.layer_time_s.get(current_layer_index, 0.0) + seg_t
+                                # Accumulate fan*time for time-weighted average per layer
+                                heur.layer_fan_time_255[current_layer_index] = heur.layer_fan_time_255.get(current_layer_index, 0.0) + (current_fan_0_255 * seg_t)
 
         # Post-process slicer hints
         # Also check common keys for printer model
@@ -790,6 +959,79 @@ class GcodeInspector:
             self.filament_diameter_mm = float(header_diam)
         elif commented_diameter and 1.0 < commented_diameter < 3.2:
             self.filament_diameter_mm = commented_diameter
+
+        # Filament MVS (Max Volumetric Speed) from header or user override
+        filament_mvs: Optional[float] = None
+        try:
+            # Common keys used by slicers
+            for k in ("max_volumetric_speed", "filament_max_volumetric_speed", "maximum_volumetric_speed"):
+                if k in header_kv:
+                    val = header_kv.get(k)
+                    if isinstance(val, (int, float)):
+                        filament_mvs = float(val)
+                        break
+                    if isinstance(val, list) and val:
+                        try:
+                            filament_mvs = float(val[0])
+                            break
+                        except Exception:
+                            pass
+                    if isinstance(val, str):
+                        m = re.match(fr"^\s*({float_re})\s*$", val)
+                        if m:
+                            filament_mvs = float(m.group(1))
+                            break
+            # Fallback: search any header key containing both 'volumetric' and 'speed'
+            if filament_mvs is None:
+                for k, v in header_kv.items():
+                    lk = str(k).lower()
+                    if ("volumetric" in lk) and ("speed" in lk):
+                        try:
+                            if isinstance(v, (int, float)):
+                                filament_mvs = float(v)
+                                break
+                            if isinstance(v, list) and v:
+                                filament_mvs = float(v[0])
+                                break
+                            if isinstance(v, str):
+                                m = re.search(fr"({float_re})", v)
+                                if m:
+                                    filament_mvs = float(m.group(1))
+                                    break
+                        except Exception:
+                            continue
+        except Exception:
+            filament_mvs = None
+        # User override takes precedence if provided
+        if self.flow_limit_override_mm3_s is not None:
+            filament_mvs = float(self.flow_limit_override_mm3_s)
+
+        # Filament brand/name/color from header or comments
+        def _str_first(val: object) -> Optional[str]:
+            if isinstance(val, list):
+                for v in val:
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            elif isinstance(val, str) and val.strip():
+                return val.strip()
+            return None
+
+        brand = _str_first(header_kv.get("filament_brand")) or _str_first(header_kv.get("filament_vendor")) or _str_first(header_kv.get("manufacturer"))
+        name = _str_first(header_kv.get("filament_name")) or _str_first(header_kv.get("filament_fullname"))
+        color = _str_first(header_kv.get("filament_color")) or _str_first(header_kv.get("filament_colour")) or _str_first(header_kv.get("color"))
+        if not brand:
+            brand = _str_first(comment_kv.get("filament_brand")) or _str_first(comment_kv.get("brand")) or _str_first(comment_kv.get("vendor")) or _str_first(comment_kv.get("manufacturer"))
+        if not name:
+            name = _str_first(comment_kv.get("filament_name")) or _str_first(comment_kv.get("filament_fullname")) or _str_first(comment_kv.get("name"))
+        if not color:
+            color = _str_first(comment_kv.get("filament_color")) or _str_first(comment_kv.get("filament_colour")) or _str_first(comment_kv.get("color"))
+        # Fallback to comment free-text
+        if not brand:
+            brand = commented_brand_guess
+        if not name:
+            name = commented_name_hint
+        if not color:
+            color = commented_color_hint
 
         # Prefer header initial-layer temps if available (Bambu/Orca), else keep detected layer0 temps
         def _get_header_first(values: object) -> Optional[float]:
@@ -876,6 +1118,7 @@ class GcodeInspector:
                 length_mm,
                 heur,
                 extrusion,
+                filament_mvs_mm3_s=filament_mvs,
             )
         )
 
@@ -1021,6 +1264,10 @@ class GcodeInspector:
             flags=flags,
             notes=notes,
             printer_model=heur.printer_model,
+            filament_brand=brand,
+            filament_name=name,
+            filament_color=color,
+            filament_mvs_mm3_s=filament_mvs,
             heuristics=heur,
             extrusion=extrusion,
             slicer_length_mm=slicer_length_mm,
@@ -1062,6 +1309,42 @@ class GcodeInspector:
         for pat, key in PRN_PATS:
             if pat.search(t):
                 return key
+        return None
+
+    @staticmethod
+    def _detect_filament_brand(text: str) -> Optional[str]:
+        t = (text or "").lower()
+        brands = {
+            "prusament": "Prusament",
+            "bambu lab": "Bambu",
+            "bambulab": "Bambu",
+            "bambu": "Bambu",
+            "polymaker": "Polymaker",
+            "hatchbox": "HATCHBOX",
+            "sunlu": "SUNLU",
+            "esun": "eSUN",
+            "overture": "OVERTURE",
+            "e3d": "E3D",
+            "colorfabb": "colorFabb",
+            "fillamentum": "Fillamentum",
+            "priline": "PRILINE",
+            "sainsmart": "SainSmart",
+            "eryone": "ERYONE",
+            "geeetech": "Geeetech",
+            "creality": "Creality",
+            "amazonbasics": "AmazonBasics",
+            "amolen": "AMOLEN",
+            "3dxtech": "3DXTech",
+            "atomic": "Atomic",
+            "formfutura": "FormFutura",
+            "fiberlogy": "Fiberlogy",
+            "matterhackers": "MatterHackers",
+            "proto-pasta": "Proto-pasta",
+            "protopasta": "Proto-pasta",
+        }
+        for key, pretty in brands.items():
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])", t):
+                return pretty
         return None
 
     
@@ -1163,6 +1446,7 @@ class GcodeInspector:
         length_mm: float,
         heur: HeuristicStats,
         extrusion: ExtrusionStats,
+        filament_mvs_mm3_s: Optional[float] = None,
     ) -> List[str]:
         flags: List[str] = []
 
@@ -1302,14 +1586,7 @@ class GcodeInspector:
         if heur.flow_override is not None and not (95 <= heur.flow_override <= 105):
             flags.append(f"Flow override (M221) set to {heur.flow_override:.0f}%; extrusion scaling active.")
 
-        # Extrusion mode never explicitly set
-        if retraction and retraction.samples is not None and retraction is not None:
-            pass
-        # If extrusion.absolute_mode is None, M82/M83 never appeared
-        if getattr(retraction, 'samples', None) is not None:  # no-op to keep lints quiet
-            pass
-        # Use extrusion.absolute_mode via temps placeholder not available here; instead infer via heur.mode_switches and seen M82/M83? We'll simply warn if mode wasn't set
-        # Note: We didn't pass extrusion here; adjust to warn via header in caller if needed
+        # Extrusion mode warning handled above; removed no-op placeholders.
 
         # Frequent temp changes (prefer print-phase temps), filter out purge/cooldown
         src = temps.nozzle_print_setpoints or [t for t in temps.nozzle_setpoints if t >= 150]
@@ -1343,14 +1620,17 @@ class GcodeInspector:
                 "PC": (12.0, 18.0),
             }.get(m, (12.0, 20.0))
             # Printer/hotend multipliers (conservative)
+            # Special-case H2S with PLA to align with ~25 mm^3/s capability
+            if (printer == "bambu_h2s") and (m == "PLA"):
+                return (22.0, 28.0)
             mult = {
                 None: 1.0,
                 "bambu_a1": 1.0,
                 "bambu_p1s": 1.1,
                 "bambu_x1c": 1.2,
                 "bambu_h2d": 1.2,
-                # H2S is a high-flow hotend; raise limits to reduce false positives
-                "bambu_h2s": 3.0,
+                # H2S is high-flow; moderately raise generic limits
+                "bambu_h2s": 1.4,
             }.get(printer, 1.0)
             return base[0] * mult, base[1] * mult
 
@@ -1360,6 +1640,17 @@ class GcodeInspector:
                 flags.append(f"Volumetric flow very high (~{heur.max_volumetric_mm3_s:.1f} mm^3/s); may exceed hotend capability.")
             elif heur.max_volumetric_mm3_s > warn:
                 flags.append(f"Volumetric flow high (~{heur.max_volumetric_mm3_s:.1f} mm^3/s); watch for under-extrusion.")
+            # Compare against typical filament safe limits (stricter guidance)
+            try:
+                safe_low, safe_high = _flow_safe_limits(material, heur.printer_model, filament_mvs_mm3_s)
+                # Apply 5%/0.5 mm^3/s tolerance
+                tol = max(0.5, safe_high * 0.05)
+                if heur.max_volumetric_mm3_s > (safe_high + tol):
+                    flags.append(
+                        f"Flow above {('MVS' if safe_high and safe_high != 0 else 'typical')} {material} limit (~{safe_high:.0f} mm^3/s); risk of under-extruded or matte bands."
+                    )
+            except Exception:
+                pass
         # First-layer volumetric threshold scaled by printer capability
         if heur.max_volumetric_first_layer_mm3_s is not None:
             # Reuse the same multiplier logic as vol_limits()
@@ -1369,7 +1660,7 @@ class GcodeInspector:
                 "bambu_p1s": 1.1,
                 "bambu_x1c": 1.2,
                 "bambu_h2d": 1.2,
-                "bambu_h2s": 3.0,
+                "bambu_h2s": 1.4,
             }.get(heur.printer_model, 1.0)
             first_layer_warn = 12.0 * mult
             if heur.max_volumetric_first_layer_mm3_s > first_layer_warn:
@@ -1391,13 +1682,7 @@ def print_report(summary: GcodeSummary) -> None:
     print(f"File: {summary.file}")
     print("")
     if summary.printer_model:
-        pretty = {
-            "bambu_a1": "Bambu A1/A1 mini",
-            "bambu_p1s": "Bambu P1S/P1P",
-            "bambu_x1c": "Bambu X1C/X1E",
-            "bambu_h2d": "Bambu H2D hotend",
-            "bambu_h2s": "Bambu H2S hotend",
-        }.get(summary.printer_model, summary.printer_model)
+        pretty = _printer_pretty(summary.printer_model) or summary.printer_model
         print("Printer")
         print(f"- Detected: {pretty}")
         print("")
@@ -1428,6 +1713,13 @@ def print_report(summary: GcodeSummary) -> None:
     print(f"- Inferred: {summary.inferred_material} (confidence: {summary.material_confidence})")
     print(f"- Filament diameter: {summary.filament_diameter_mm:.2f} mm")
     print(f"- Density used: {summary.density_used_g_cm3:.2f} g/cm^3")
+    if any([summary.filament_brand, summary.filament_name, summary.filament_color]):
+        if summary.filament_brand:
+            print(f"- Brand: {summary.filament_brand}")
+        if summary.filament_name:
+            print(f"- Spool/name: {summary.filament_name}")
+        if summary.filament_color:
+            print(f"- Color: {summary.filament_color}")
     print("")
     print("Usage")
     print(f"- Length: {summary.estimated_length_mm/1000.0:.2f} m")
@@ -1490,39 +1782,76 @@ def print_report(summary: GcodeSummary) -> None:
             print(f"- Avg time/layer: {_fmt_time_short(summary.avg_layer_time_s)}")
             print(f"- First layer time: {_fmt_time_short(summary.first_layer_time_s)}")
             print(f"- Last layer time: {_fmt_time_short(summary.last_layer_time_s)}")
-        # Show significant consecutive deltas (distance/time)
+        # Show significant consecutive deltas (distance/time) with robust thresholds
+        def _median(xs: List[float]) -> float:
+            if not xs:
+                return 0.0
+            s = sorted(xs)
+            n = len(s)
+            m = n // 2
+            return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
+        def _mad(xs: List[float]) -> float:
+            if not xs:
+                return 0.0
+            med = _median(xs)
+            dev = [abs(x - med) for x in xs]
+            return _median(dev)
+        def _sig_jumps(keys: List[int], vals: List[float], abs_floor: float, pct_min: float, sigma_k: float = 3.0, min_baseline: float = 5.0) -> List[str]:
+            if len(keys) < 2:
+                return []
+            diffs: List[float] = []
+            for i in range(1, len(keys)):
+                diffs.append(vals[i] - vals[i-1])
+            med = _median(diffs)
+            mad = _mad(diffs)
+            scale = mad * 1.4826 if mad > 0 else 0.0
+            out: List[str] = []
+            for i in range(1, len(keys)):
+                a, b = vals[i-1], vals[i]
+                d = b - a
+                if a <= min_baseline:
+                    continue
+                p = (abs(d) / a * 100.0) if a > 0 else 0.0
+                z_ok = (scale > 0 and abs(d - med) >= sigma_k * scale)
+                abs_ok = abs(d) >= abs_floor
+                pct_ok = p >= pct_min
+                if (z_ok or abs_ok) and pct_ok:
+                    out.append((i, d, p))
+            # Format top 10 by absolute delta
+            out_sorted = sorted(out, key=lambda t: abs(t[1]), reverse=True)[:10]
+            lines: List[str] = []
+            for i, d, p in out_sorted:
+                lines.append(f"L{keys[i-1]}→L{keys[i]}: {d:+.0f} mm ({p:.0f}%)")
+            return lines
+
         lm = summary.heuristics.layer_move_mm
         lt = summary.heuristics.layer_time_s
         if lm:
-            keys = sorted(lm.keys())
-            vals = [lm[k] for k in keys]
-            avg_mv = sum(vals) / len(vals)
-            sigs: List[str] = []
-            for i in range(1, len(keys)):
-                a, b = vals[i-1], vals[i]
-                d = b - a
-                p = (abs(d) / max(1e-6, a)) * 100.0 if a > 0 else 0.0
-                if abs(d) > max(0.1 * avg_mv, 50.0) and p > 40.0:
-                    sigs.append(f"L{keys[i-1]}→L{keys[i]}: {d:+.0f} mm ({p:.0f}%)")
-            if sigs:
+            m_keys = sorted(lm.keys())
+            m_vals = [lm[k] for k in m_keys]
+            m_med = _median(m_vals)
+            mv_lines = _sig_jumps(m_keys, m_vals, abs_floor=max(0.08 * m_med, 60.0), pct_min=35.0)
+            if mv_lines:
                 print("- Significant movement jumps:")
-                for s in sigs[:10]:
+                for s in mv_lines:
                     print(f"  • {s}")
         if lt:
-            keys = sorted(lt.keys())
-            vals = [lt[k] for k in keys]
-            avg_t = sum(vals) / len(vals)
-            sigs: List[str] = []
-            for i in range(1, len(keys)):
-                a, b = vals[i-1], vals[i]
-                d = b - a
-                p = (abs(d) / max(1e-6, a)) * 100.0 if a > 0 else 0.0
-                if abs(d) > max(0.1 * avg_t, 10.0) and p > 40.0:
-                    sigs.append(f"L{keys[i-1]}→L{keys[i]}: {int(d):+d} s ({p:.0f}%)")
-            if sigs:
+            t_keys = sorted(lt.keys())
+            t_vals = [lt[k] for k in t_keys]
+            t_med = _median(t_vals)
+            # Time is in seconds
+            t_lines = _sig_jumps(t_keys, t_vals, abs_floor=max(0.12 * t_med, 12.0), pct_min=35.0)
+            if t_lines:
                 print("- Significant time jumps:")
-                for s in sigs[:10]:
-                    print(f"  • {s}")
+                for s in t_lines:
+                    # Replace unit for time lines
+                    layer_pair, rest = s.split(": ", 1)
+                    amt, pct = rest.split(" (", 1)
+                    try:
+                        amt_num = int(float(amt.split()[0]))
+                    except Exception:
+                        amt_num = 0
+                    print(f"  • {layer_pair}: {amt_num:+d} s ({pct}")
         print("")
     print("Retraction")
     print(f"- Samples: {len(summary.retraction.samples)}")
@@ -1710,7 +2039,7 @@ def _should_hold() -> bool:
 
 
 def _plot_layer_metrics(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
-    # No-op if no layer metrics
+    """Per-layer movement/time with jump markers; returns Path or None."""
     heur = summary.heuristics
     if not heur or (not heur.layer_move_mm and not heur.layer_time_s):
         return None
@@ -1726,36 +2055,70 @@ def _plot_layer_metrics(summary: GcodeSummary, out_path: Optional[Path] = None) 
     move = [heur.layer_move_mm.get(i, float('nan')) for i in layers]
     times = [heur.layer_time_s.get(i, float('nan')) for i in layers]
 
-    # Compute significant jumps
-    def sig_mask(vals: List[float], abs_min: float, pct_min: float) -> List[bool]:
-        mask = [False] * len(vals)
-        # Use previous non-nan for baseline
-        prev_idx = None
+    # Compute significant jumps using a robust delta-based detector
+    def _finite_series(vals: List[float]) -> List[Tuple[int, float]]:
+        out: List[Tuple[int, float]] = []
         for i, v in enumerate(vals):
-            if i == 0 or not (isinstance(v, float) and not math.isnan(v)):
-                if isinstance(v, float) and not math.isnan(v):
-                    prev_idx = i
+            if isinstance(v, float) and not math.isnan(v):
+                out.append((i, float(v)))
+        return out
+
+    def _median(xs: List[float]) -> float:
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        n = len(s)
+        mid = n // 2
+        if n % 2:
+            return s[mid]
+        return 0.5 * (s[mid - 1] + s[mid])
+
+    def _mad(xs: List[float]) -> float:
+        # Median absolute deviation
+        if not xs:
+            return 0.0
+        m = _median(xs)
+        dev = [abs(x - m) for x in xs]
+        return _median(dev)
+
+    def robust_jump_mask(vals: List[float], abs_floor: float, pct_min: float, sigma_k: float = 3.0, min_baseline: float = 1e-6) -> List[bool]:
+        mask = [False] * len(vals)
+        finite = _finite_series(vals)
+        if len(finite) < 2:
+            return mask
+        # Differences between consecutive finite points (aligned to the later index)
+        diffs: List[Tuple[int, float, float]] = []  # (idx, diff, prev_val)
+        for (i_prev, v_prev), (i_cur, v_cur) in zip(finite[:-1], finite[1:]):
+            diffs.append((i_cur, v_cur - v_prev, v_prev))
+        diff_vals = [d for (_, d, _) in diffs]
+        med = _median(diff_vals)
+        mad = _mad(diff_vals)
+        # Scale MAD to approximate std-dev (consistency with normal dist.)
+        # If MAD==0 (flat regions), fall back to abs_floor only.
+        scale = mad * 1.4826 if mad > 0 else 0.0
+        for idx, d, prev in diffs:
+            if prev <= min_baseline:
                 continue
-            if prev_idx is None or math.isnan(vals[prev_idx]):
-                prev_idx = i
-                continue
-            a, b = vals[prev_idx], v
-            d = b - a
-            p = (abs(d) / a * 100.0) if a > 0 else 0.0
-            if abs(d) > abs_min and p > pct_min:
-                mask[i] = True
-            prev_idx = i
+            pct = (abs(d) / prev) * 100.0 if prev > 0 else 0.0
+            # Two-part rule: robust z-score AND absolute floor AND percent change
+            z_ok = (scale > 0 and abs(d - med) >= sigma_k * scale)
+            abs_ok = abs(d) >= abs_floor
+            pct_ok = pct >= pct_min
+            if (z_ok or abs_ok) and pct_ok:
+                mask[idx] = True
         return mask
 
-    # Thresholds
+    # Thresholds derived from robust central tendency
     mv_vals = [v for v in move if isinstance(v, float) and not math.isnan(v)]
     t_vals = [v for v in times if isinstance(v, float) and not math.isnan(v)]
-    mv_avg = sum(mv_vals) / len(mv_vals) if mv_vals else 0.0
-    t_avg = sum(t_vals) / len(t_vals) if t_vals else 0.0
-    mv_mask = sig_mask(move, abs_min=max(0.1 * mv_avg, 50.0), pct_min=40.0)
-    t_mask = sig_mask(times, abs_min=max(0.1 * t_avg, 10.0), pct_min=40.0)
+    mv_med = _median(mv_vals)
+    t_med = _median(t_vals)
+    # Movement deltas must exceed either 8% of median movement or 60 mm, and 35% relative change
+    mv_mask = robust_jump_mask(move, abs_floor=max(0.08 * mv_med, 60.0), pct_min=35.0, sigma_k=3.0, min_baseline=5.0)
+    # Time deltas must exceed either 12% of median time or 12 s, and 35% relative change
+    t_mask = robust_jump_mask(times, abs_floor=max(0.12 * t_med, 12.0), pct_min=35.0, sigma_k=3.0, min_baseline=5.0)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
     ax1, ax2 = axes
     ax1.plot(layers, move, label="Movement (mm)", color="#1f77b4")
     # Highlight significant points
@@ -1773,20 +2136,436 @@ def _plot_layer_metrics(summary: GcodeSummary, out_path: Optional[Path] = None) 
     sig_vals_t = [times[i]/60.0 for i, m in enumerate(t_mask) if m]
     if sig_layers_t:
         ax2.scatter(sig_layers_t, sig_vals_t, color="red", zorder=3, label="Significant jump")
-    ax2.set_xlabel("Layer index")
+    ax2.set_xlabel("Layer")
     ax2.set_ylabel("Time (min)")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
 
-    fig.suptitle(f"Layer metrics: {summary.file.stem}")
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    _apply_plot_style(fig,
+                      title="Layer Metrics",
+                      subtitle=_plot_subtitle(summary),
+                      caption=(
+                          "Red markers = significant layer-to-layer jumps.\n"
+                          "Big per-layer deltas often align with feature/cooling changes; watch for artifacts/time spikes."
+                      ))
 
     if out_path is None:
         out_path = summary.file.with_suffix('.layer_metrics.png')
-    fig.savefig(out_path)
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
     # Attach note
     summary.notes.append(f"Saved layer metrics plot: {out_path.name}")
+    return out_path
+
+
+def _plot_e_per_mm(summary: GcodeSummary, out_path: Optional[Path] = None, window: Optional[int] = None) -> Optional[Path]:
+    """E/mm per segment with rolling mean/std; returns Path or None."""
+    heur = summary.heuristics
+    if not heur or not heur.e_per_mm_samples:
+        return None
+    plt = _ensure_matplotlib()
+    if plt is None:
+        summary.notes.append("Matplotlib not available; skipping E/mm plot.")
+        return None
+
+    series = [v for v in heur.e_per_mm_samples if isinstance(v, float) and not math.isnan(v) and math.isfinite(v)]
+    if not series:
+        return None
+    layers_opt = heur.e_per_mm_layers if (hasattr(heur, 'e_per_mm_layers') and heur.e_per_mm_layers and len(heur.e_per_mm_layers) == len(heur.e_per_mm_samples)) else None
+
+    n = len(series)
+    x = list(range(n))
+    # Determine rolling window size if not provided: ~1% of segments, bounded [50, 1000]
+    if window is None:
+        w = max(50, min(1000, max(1, int(n * 0.01))))
+    else:
+        w = max(2, int(window))
+
+    # Rolling standard deviation using cumulative sums for O(n)
+    csum = [0.0]
+    csum2 = [0.0]
+    for v in series:
+        csum.append(csum[-1] + v)
+        csum2.append(csum2[-1] + v * v)
+
+    def roll_std(idx: int) -> float:
+        # centered trailing window [idx-w+1, idx]
+        i0 = max(0, idx - w + 1)
+        i1 = idx + 1
+        k = i1 - i0
+        if k <= 1:
+            return 0.0
+        s = csum[i1] - csum[i0]
+        s2 = csum2[i1] - csum2[i0]
+        mean = s / k
+        var = max(0.0, (s2 / k) - (mean * mean))
+        return math.sqrt(var)
+
+    rolling_std = [roll_std(i) for i in range(n)]
+
+    # Rolling mean for trend
+    def roll_mean(idx: int) -> float:
+        i0 = max(0, idx - w + 1)
+        i1 = idx + 1
+        k = i1 - i0
+        if k <= 0:
+            return series[idx]
+        return (csum[i1] - csum[i0]) / k
+    rolling_mean = [roll_mean(i) for i in range(n)]
+
+    # Robust y-limits via percentiles
+    def _percentile(vals: List[float], q: float) -> float:
+        if not vals:
+            return 0.0
+        s = sorted(vals)
+        pos = (len(s) - 1) * q
+        lo = int(pos)
+        hi = min(lo + 1, len(s) - 1)
+        frac = pos - lo
+        return s[lo] * (1 - frac) + s[hi] * frac
+    p1 = _percentile(series, 0.01)
+    p99 = _percentile(series, 0.99)
+
+    # Spike/dip detection using rolling mean/std with percentile gating and prominence
+    spikes: List[int] = []
+    dips: List[int] = []
+    for i, xval in enumerate(series):
+        mu = rolling_mean[i]
+        sd = max(1e-9, rolling_std[i])
+        z = (xval - mu) / sd
+        is_spike = (z >= 3.5) and (xval >= p99)
+        is_dip = (z <= -3.5) and (xval <= p1)
+        # Prominence relative to local mean
+        prom = abs(xval - mu)
+        prom_ok = prom >= max(0.01, 0.25 * max(mu, 1e-6))
+        if is_spike and prom_ok:
+            spikes.append(i)
+        elif is_dip and prom_ok:
+            dips.append(i)
+
+    # Collapse contiguous detections to representative peaks (max |z|)
+    def _collapse(idxs: List[int]) -> List[int]:
+        out: List[int] = []
+        if not idxs:
+            return out
+        run = [idxs[0]]
+        for j in idxs[1:]:
+            if j == run[-1] + 1:
+                run.append(j)
+            else:
+                # pick best in run
+                best = max(run, key=lambda k: abs((series[k] - rolling_mean[k]) / max(1e-9, rolling_std[k])))
+                out.append(best)
+                run = [j]
+        best = max(run, key=lambda k: abs((series[k] - rolling_mean[k]) / max(1e-9, rolling_std[k])))
+        out.append(best)
+        return out
+
+    spikes = _collapse(spikes)
+    dips = _collapse(dips)
+
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax1.plot(x, series, color="#1f77b4", linewidth=0.6, alpha=0.6, label="E/mm per segment")
+    ax1.plot(x, rolling_mean, color="#2ca02c", linewidth=1.2, label=f"Rolling mean (w={w})")
+    ax1.set_xlabel("Segment index")
+    ax1.set_ylabel("Extrusion per distance (E/mm)")
+    ax1.grid(True, alpha=0.3)
+    # Apply clipped limits with small padding
+    if p99 > p1:
+        pad = max(1e-6, (p99 - p1) * 0.1)
+        ax1.set_ylim(p1 - pad, p99 + pad)
+
+    # Secondary axis for rolling std-dev
+    ax2 = ax1.twinx()
+    ax2.plot(x, rolling_std, color="#d62728", linewidth=1.0, alpha=0.85, label=f"Rolling std-dev (w={w})")
+    ax2.set_ylabel("Rolling std-dev (E/mm)")
+
+    # Mark spikes/dips
+    if spikes:
+        ax1.scatter([x[i] for i in spikes], [series[i] for i in spikes], s=18, color="#ff7f0e", marker="^", label="Spikes")
+    if dips:
+        ax1.scatter([x[i] for i in dips], [series[i] for i in dips], s=18, color="#1f77b4", marker="v", label="Dips")
+
+    # Build a combined legend
+    lines = ax1.get_lines() + ax2.get_lines()
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc="upper right")
+
+    _apply_plot_style(fig,
+                      title="Extrusion per Distance (E/mm)",
+                      subtitle=_plot_subtitle(summary),
+                      caption=(
+                          "Blue = E/mm, Green = rolling mean, Red = rolling std (right axis). Triangles mark spikes/dips.\n"
+                          "Stable E/mm => consistent line width; spikes/dips suggest flow/pressure issues (PA/temp/moisture/clogs)."
+                      ))
+
+    if out_path is None:
+        out_path = summary.file.with_suffix('.e_per_mm.png')
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    # Add a brief anomalies summary to notes
+    if spikes or dips:
+        summary.notes.append(f"E/mm anomalies: spikes={len(spikes)}, dips={len(dips)}")
+    if layers_opt and (spikes or dips):
+        # Report top 3 by |z| with layer indices
+        all_idxs = spikes + dips
+        scored = sorted(all_idxs, key=lambda k: abs((series[k] - rolling_mean[k]) / max(1e-9, rolling_std[k])), reverse=True)[:3]
+        parts = []
+        for k in scored:
+            z = (series[k] - rolling_mean[k]) / max(1e-9, rolling_std[k])
+            layer = layers_opt[k] if k < len(layers_opt) else None
+            parts.append(f"L{layer if layer is not None else '?'}: z={z:+.1f}")
+        if parts:
+            summary.notes.append("E/mm top anomalies: " + ", ".join(parts))
+    summary.notes.append(f"Saved E/mm plot: {out_path.name}")
+    return out_path
+
+def _cooling_thresholds(material: str) -> Tuple[float, float]:
+    m = (material or "").upper()
+    # fan_low (%), short_time (s)
+    if "PLA" in m:
+        return 20.0, 20.0
+    if "PETG" in m:
+        return 10.0, 20.0
+    if "ABS" in m or "ASA" in m:
+        return 5.0, 15.0
+    return 15.0, 20.0
+
+
+def _plot_cooling_state(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
+    """Layer time vs time-weighted fan%; returns Path or None."""
+    heur = summary.heuristics
+    if not heur or not heur.layer_time_s:
+        return None
+    plt = _ensure_matplotlib()
+    if plt is None:
+        summary.notes.append("Matplotlib not available; skipping cooling plot.")
+        return None
+
+    layers = sorted(heur.layer_time_s.keys())
+    t_s = [heur.layer_time_s.get(i, 0.0) for i in layers]
+    # Compute time-weighted average fan per layer
+    fan_pct = []
+    for i in layers:
+        t = heur.layer_time_s.get(i, 0.0)
+        ft = heur.layer_fan_time_255.get(i, 0.0)
+        pct = (ft / t / 255.0 * 100.0) if t > 0 else 0.0
+        fan_pct.append(pct)
+
+    low_fan, short_time = _cooling_thresholds(summary.inferred_material)
+    risk_mask = [(p <= low_fan and t <= short_time) for p, t in zip(fan_pct, t_s)]
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    # Plot non-risk points
+    x = t_s
+    y = fan_pct
+    x_safe = [xv for xv, r in zip(x, risk_mask) if not r]
+    y_safe = [yv for yv, r in zip(y, risk_mask) if not r]
+    x_risk = [xv for xv, r in zip(x, risk_mask) if r]
+    y_risk = [yv for yv, r in zip(y, risk_mask) if r]
+    ax.scatter(x_safe, y_safe, s=18, alpha=0.7, label="Layers", color="#1f77b4")
+    if x_risk:
+        ax.scatter(x_risk, y_risk, s=32, alpha=0.9, label="High risk (low fan + short layer)", color="#d62728")
+
+    # Risk region shading
+    ax.axvspan(0, short_time, ymin=0.0, ymax=low_fan / 100.0, color="#d62728", alpha=0.12)
+    ax.axhline(low_fan, color="#d62728", linestyle="--", linewidth=0.8)
+    ax.axvline(short_time, color="#d62728", linestyle="--", linewidth=0.8)
+
+    ax.set_xlabel("Layer time (s)")
+    ax.set_ylabel("Avg fan per layer (%)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+    # Tidy limits with small padding
+    if t_s:
+        xmin, xmax = min(t_s), max(t_s)
+        if xmax > xmin:
+            pad = (xmax - xmin) * 0.08
+            ax.set_xlim(max(0, xmin - pad), xmax + pad)
+    if fan_pct:
+        ymin, ymax = min(fan_pct), max(fan_pct)
+        if ymax > ymin:
+            pad = (ymax - ymin) * 0.08
+            ax.set_ylim(max(0, ymin - pad), min(100.0, ymax + pad))
+    _apply_plot_style(fig,
+                      title="Cooling vs Layer Time",
+                      subtitle=_plot_subtitle(summary),
+                      caption=(
+                          "Red shaded area = short layers with low fan.\n"
+                          "Short layers need cooling; low fan here softens detail or warps."
+                      ))
+
+    if out_path is None:
+        out_path = summary.file.with_suffix('.cooling.png')
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    summary.notes.append(f"Saved cooling plot: {out_path.name}")
+    return out_path
+
+def _plot_corner_stress(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
+    """Corner stress index over time; returns Path or None."""
+    heur = summary.heuristics
+    if not heur or not heur.corner_samples:
+        return None
+    plt = _ensure_matplotlib()
+    if plt is None:
+        summary.notes.append("Matplotlib not available; skipping corner stress plot.")
+        return None
+
+    samples = heur.corner_samples
+    times_min = [t / 60.0 for (t, _, _, _, _, _) in samples]
+    stress = [s for (_, s, _, _, _, _) in samples]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    # Rolling mean for a smoother trendline
+    n = len(stress)
+    if n:
+        w = max(10, min(1000, max(1, int(n * 0.01))))
+        csum = [0.0]
+        for v in stress:
+            csum.append(csum[-1] + v)
+        def rmean(i: int) -> float:
+            i0 = max(0, i - w + 1)
+            i1 = i + 1
+            k = i1 - i0
+            return (csum[i1] - csum[i0]) / max(1, k)
+        smooth = [rmean(i) for i in range(n)]
+    else:
+        smooth = []
+        w = 0
+    ax.plot(times_min, stress, color="#9467bd", linewidth=0.6, alpha=0.6, label="Stress index")
+    if smooth:
+        ax.plot(times_min, smooth, color="#2ca02c", linewidth=1.4, label=f"Rolling mean (w={w})")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Stress index (dimensionless)")
+    ax.grid(True, alpha=0.3)
+    # Threshold guideline: 1.0 indicates incoming speed ≈ limit
+    ax.axhline(1.0, color="#d62728", linestyle="--", linewidth=1.0, label="Risk threshold")
+    # Highlight exceedances
+    ex_x = [tm for tm, s in zip(times_min, stress) if s >= 1.0]
+    ex_y = [s for s in stress if s >= 1.0]
+    if ex_x:
+        ax.scatter(ex_x, ex_y, s=12, color="#d62728", alpha=0.9, marker="x", label=">= threshold")
+    ax.legend(loc="upper right")
+    _apply_plot_style(fig,
+                      title="Corner Stress Index",
+                      subtitle=_plot_subtitle(summary),
+                      caption=(
+                          "Dashed line = risk threshold (~1.0). Points above: corners where incoming speed approaches limits.\n"
+                          "High stress correlates with ringing/overshoot/skips; useful for accel/JD/SCV tuning."
+                      ))
+
+    if out_path is None:
+        out_path = summary.file.with_suffix('.corner_stress.png')
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    summary.notes.append(f"Saved corner stress plot: {out_path.name}")
+    return out_path
+
+def _flow_safe_limits(material: str, printer: Optional[str] = None, mvs_override: Optional[float] = None) -> Tuple[float, float]:
+    # If a filament-specific MVS is provided, prefer that (use a 20% band below it)
+    if mvs_override and mvs_override > 0:
+        high = float(mvs_override)
+        low = max(0.0, high * 0.8)
+        return low, high
+    m = (material or "").upper()
+    p = (printer or "").lower() if printer else None
+    # Printer-specific adjustments
+    if p == "bambu_h2s" and "PLA" in m:
+        # High-flow H2S with PLA: typical safe limit around 25 mm^3/s
+        return 18.0, 25.0
+    # Material defaults (conservative)
+    if "PETG" in m:
+        return 6.0, 9.0
+    if "ABS" in m or "ASA" in m:
+        return 8.0, 12.0
+    if "PLA" in m:
+        return 8.0, 12.0
+    # Default conservative range
+    return 6.0, 10.0
+
+
+def _plot_volumetric_flow(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
+    """Volumetric flow (mm^3/s) vs time; returns Path or None."""
+    heur = summary.heuristics
+    if not heur or not heur.vol_samples:
+        return None
+    plt = _ensure_matplotlib()
+    if plt is None:
+        summary.notes.append("Matplotlib not available; skipping flow plot.")
+        return None
+
+    # Compute per-segment flow rates and cumulative time
+    radius_mm = summary.filament_diameter_mm / 2.0
+    area_mm2 = math.pi * radius_mm * radius_mm
+    flows: List[float] = []
+    times_s: List[float] = []
+    cum = 0.0
+    over_count = 0
+    low, high = _flow_safe_limits(summary.inferred_material, summary.printer_model, summary.filament_mvs_mm3_s)
+    # Use a tolerance to avoid flagging tiny numeric overshoots
+    tol = max(0.5, high * 0.05) if high else 0.5
+    for de, t, _fl in heur.vol_samples:
+        if t <= 0:
+            continue
+        rate = (de / t) * area_mm2  # mm^3/s
+        flows.append(rate)
+        cum += t
+        times_s.append(cum)
+        if high and rate > (high + tol):
+            over_count += 1
+
+    if not flows:
+        return None
+
+    t_min = [v / 60.0 for v in times_s]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(t_min, flows, color="#1f77b4", linewidth=0.6, alpha=0.6, label="Flow (mm³/s)")
+    # Rolling mean smoothing (~1% of samples, bounded)
+    n = len(flows)
+    if n >= 5:
+        w = max(10, min(1000, max(1, int(n * 0.01))))
+        csum = [0.0]
+        for v in flows:
+            csum.append(csum[-1] + v)
+        def rmean(i: int) -> float:
+            i0 = max(0, i - w + 1)
+            i1 = i + 1
+            k = i1 - i0
+            return (csum[i1] - csum[i0]) / max(1, k)
+        smooth = [rmean(i) for i in range(n)]
+        ax.plot(t_min, smooth, color="#2ca02c", linewidth=1.4, label=f"Rolling mean (w={w})")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Flow (mm³/s)")
+    ax.grid(True, alpha=0.3)
+
+    # Safe range shading and threshold line
+    ax.axhspan(low, high, color="#2ca02c", alpha=0.12, label=f"Safe {low:.0f}–{high:.0f}")
+    ax.axhline(high, color="#d62728", linestyle="--", linewidth=1.0, label=f"Limit {high:.0f}")
+    # Mark exceedances
+    if high:
+        exceed_x = [tm for tm, fv in zip(t_min, flows) if fv > (high + tol)]
+        exceed_y = [fv for fv in flows if fv > (high + tol)]
+        if exceed_x:
+            ax.scatter(exceed_x, exceed_y, s=12, color="#d62728", alpha=0.9, marker="x", label="Exceedances")
+
+    ax.legend(loc="upper right")
+    _apply_plot_style(fig,
+                      title="Volumetric Flow (mm³/s)",
+                      subtitle=_plot_subtitle(summary),
+                      caption=(
+                          "Green band = typical safe range; dashed = limit; red × = exceedances.\n"
+                          "Above-limit flow risks under-extrusion/matte bands/weaker parts; use to set safe speeds/widths."
+                      ))
+
+    if out_path is None:
+        out_path = summary.file.with_suffix('.flow.png')
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+
+    if over_count:
+        summary.notes.append(f"Flow exceeded safe limit at {over_count} segments.")
+    summary.notes.append(f"Saved volumetric flow plot: {out_path.name}")
     return out_path
 
 
@@ -1804,6 +2583,91 @@ def _ensure_matplotlib():  # returns pyplot module or None
         # Try a one-time install
         if _MPL_TRIED_INSTALL:
             return None
+
+
+# ------------------------------ Plot Utilities ----------------------------- #
+
+
+def _printer_pretty(model: Optional[str]) -> Optional[str]:
+    if not model:
+        return None
+    return {
+        "bambu_a1": "Bambu A1/A1 mini",
+        "bambu_p1s": "Bambu P1S/P1P",
+        "bambu_x1c": "Bambu X1C/X1E",
+        "bambu_h2d": "Bambu H2D hotend",
+        "bambu_h2s": "Bambu H2S hotend",
+    }.get(model, model)
+
+
+def _plot_subtitle(summary: GcodeSummary) -> str:
+    parts: List[str] = [summary.file.stem]
+    pm = _printer_pretty(summary.printer_model)
+    if pm:
+        parts.append(pm)
+    if summary.inferred_material:
+        parts.append(f"{summary.inferred_material}")
+    try:
+        parts.append(f"Ø{summary.filament_diameter_mm:.2f} mm")
+    except Exception:
+        pass
+    # First-layer temps if available
+    fln = getattr(summary.temps, 'first_layer_nozzle', None)
+    flb = getattr(summary.temps, 'first_layer_bed', None)
+    if isinstance(fln, (int, float)) and isinstance(flb, (int, float)) and fln > 0 and flb > 0:
+        parts.append(f"1st layer {int(round(fln))}/{int(round(flb))}C")
+    # Layers count
+    layers = summary.total_layers
+    if not layers:
+        # Fallback: infer from heuristics
+        heur = summary.heuristics
+        if heur and (heur.layer_move_mm or heur.layer_time_s):
+            keys = list((heur.layer_move_mm or {}).keys()) + list((heur.layer_time_s or {}).keys())
+            if keys:
+                layers = max(keys) + 1
+    if layers:
+        parts.append(f"Layers: {layers}")
+    return " • ".join(parts)
+
+
+def _apply_plot_style(fig, title: str, subtitle: Optional[str] = None, caption: Optional[str] = None) -> None:
+    try:
+        import matplotlib as mpl  # type: ignore
+    except Exception:
+        # If mpl is not importable at this point, bail; caller already handles
+        return
+    # Lightly unify aesthetics
+    try:
+        rc = mpl.rcParams
+        rc.setdefault('axes.titlesize', 12)
+        rc.setdefault('axes.labelsize', 10)
+        rc.setdefault('xtick.labelsize', 9)
+        rc.setdefault('ytick.labelsize', 9)
+        rc.setdefault('legend.fontsize', 9)
+        rc.setdefault('grid.linestyle', '-')
+        rc.setdefault('grid.alpha', 0.3)
+    except Exception:
+        pass
+    # Title + subtitle
+    suptitle = title
+    if subtitle:
+        suptitle = f"{title}\n{subtitle}"
+    try:
+        fig.suptitle(suptitle)
+    except Exception:
+        pass
+    # Caption at bottom center
+    if caption:
+        try:
+            # Slightly higher y to allow two lines without clipping
+            fig.text(0.5, 0.02, caption, ha='center', va='bottom', fontsize=9, alpha=0.9)
+        except Exception:
+            pass
+    try:
+        # Reserve a bit more bottom space for multi-line captions
+        fig.tight_layout(rect=[0, 0.07, 1, 0.92])
+    except Exception:
+        pass
         _MPL_TRIED_INSTALL = True
         try:
             import subprocess, sys
@@ -1838,10 +2702,119 @@ def _analyze_single_file(path: Path, filament_diameter: float, printer_override:
     return _analyze_single_file_with_opts(path, filament_diameter, printer_override, plot=False, show_progress=True)
 
 
-def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer_override: Optional[str], plot: bool = False, show_progress: bool = True) -> str:
+def _show_options_dialog(default_filament: float = 1.75) -> Tuple[bool, Dict[str, object]]:
+    """Show a Tkinter dialog to select plotting and analysis options.
+    Returns (ok, options_dict). On cancel, returns (False, {}).
+    options keys: plot, flow, e_per_mm, corner_stress, cooling (bools),
+                  filament_diameter (float), printer_override (str or None).
+    """
+    import tkinter as tk  # type: ignore
+    from tkinter import ttk  # type: ignore
+
+    result: Dict[str, object] = {}
+    ok_pressed = {"ok": False}
+
+    root = tk.Tk()
+    root.title("G-code Inspector Options")
+    root.resizable(False, False)
+
+    frm = ttk.Frame(root, padding=10)
+    frm.grid(row=0, column=0, sticky="nsew")
+
+    # Plot options (use IntVar with explicit on/off to avoid tri-state '-')
+    plot_var = tk.IntVar(value=0)
+    flow_var = tk.IntVar(value=0)
+    epermm_var = tk.IntVar(value=0)
+    corner_var = tk.IntVar(value=0)
+    cooling_var = tk.IntVar(value=0)
+
+    ttk.Label(frm, text="Plots:").grid(row=0, column=0, sticky="w")
+    cb_plot = ttk.Checkbutton(frm, text="Layer metrics", variable=plot_var, onvalue=1, offvalue=0)
+    cb_flow = ttk.Checkbutton(frm, text="Volumetric flow", variable=flow_var, onvalue=1, offvalue=0)
+    cb_eper = ttk.Checkbutton(frm, text="E/mm + rolling std", variable=epermm_var, onvalue=1, offvalue=0)
+    cb_corner = ttk.Checkbutton(frm, text="Corner stress", variable=corner_var, onvalue=1, offvalue=0)
+    cb_cool = ttk.Checkbutton(frm, text="Cooling (fan vs layer time)", variable=cooling_var, onvalue=1, offvalue=0)
+    cb_plot.grid(row=1, column=0, sticky="w")
+    cb_flow.grid(row=2, column=0, sticky="w")
+    cb_eper.grid(row=3, column=0, sticky="w")
+    cb_corner.grid(row=4, column=0, sticky="w")
+    cb_cool.grid(row=5, column=0, sticky="w")
+    # Ensure no tri-state 'alternate' is active at start and vars are 0
+    try:
+        for v, cb in ((plot_var, cb_plot), (flow_var, cb_flow), (epermm_var, cb_eper), (corner_var, cb_corner), (cooling_var, cb_cool)):
+            v.set(0)
+            cb.state(["!alternate"])  # force out of tri-state
+    except Exception:
+        pass
+
+    # Filament diameter
+    ttk.Label(frm, text="Filament diameter (mm):").grid(row=0, column=1, padx=(15, 0), sticky="w")
+    fd_var = tk.StringVar(value=f"{default_filament:.2f}")
+    fd_entry = ttk.Entry(frm, textvariable=fd_var, width=8)
+    fd_entry.grid(row=1, column=1, padx=(15, 0), sticky="w")
+
+    # Printer override
+    ttk.Label(frm, text="Printer/hotend:").grid(row=2, column=1, padx=(15, 0), sticky="w")
+    choices = ["Auto", "A1", "P1S", "X1C", "H2D", "H2S"]
+    printer_var = tk.StringVar(value=choices[0])
+    ttk.OptionMenu(frm, printer_var, choices[0], *choices).grid(row=3, column=1, padx=(15, 0), sticky="w")
+
+    # Buttons
+    btns = ttk.Frame(frm)
+    btns.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="e")
+
+    def _on_ok():
+        ok_pressed["ok"] = True
+        try:
+            fd_text = fd_var.get().strip()
+            fd_val = float(fd_text)
+        except Exception:
+            fd_val = default_filament
+        result["filament_diameter"] = fd_val
+        result["plot"] = bool(int(plot_var.get() or 0))
+        result["flow"] = bool(int(flow_var.get() or 0))
+        result["e_per_mm"] = bool(int(epermm_var.get() or 0))
+        result["corner_stress"] = bool(int(corner_var.get() or 0))
+        result["cooling"] = bool(int(cooling_var.get() or 0))
+        # Map selection to internal printer key
+        sel = (printer_var.get() or "Auto").strip().upper()
+        mapping = {
+            "AUTO": None,
+            "A1": "bambu_a1",
+            "P1S": "bambu_p1s",
+            "X1C": "bambu_x1c",
+            "H2D": "bambu_h2d",
+            "H2S": "bambu_h2s",
+        }
+        result["printer_override"] = mapping.get(sel, None)
+        root.destroy()
+
+    def _on_cancel():
+        ok_pressed["ok"] = False
+        root.destroy()
+
+    ttk.Button(btns, text="Cancel", command=_on_cancel).grid(row=0, column=0, padx=5)
+    ttk.Button(btns, text="Run", command=_on_ok).grid(row=0, column=1, padx=5)
+
+    # Center the window a bit
+    try:
+        root.update_idletasks()
+        w = root.winfo_width()
+        h = root.winfo_height()
+        x = (root.winfo_screenwidth() // 2) - (w // 2)
+        y = (root.winfo_screenheight() // 2) - (h // 2)
+        root.geometry(f"+{x}+{y}")
+    except Exception:
+        pass
+
+    root.mainloop()
+    return ok_pressed["ok"], (result if ok_pressed["ok"] else {})
+
+
+def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer_override: Optional[str], plot: bool = False, show_progress: bool = True, e_per_mm_plot: bool = False, flow_plot: bool = False, corner_stress_plot: bool = False, cooling_plot: bool = False, flow_limit_override: Optional[float] = None) -> str:
     from io import StringIO
     buf = StringIO()
-    inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
+    inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override, flow_limit_override_mm3_s=flow_limit_override)
     # Wrap the file iterator with a lightweight progress bar when appropriate
     total_bytes = None
     try:
@@ -1907,6 +2880,30 @@ def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer
         except Exception as e:
             # Non-fatal; include a note
             summary.notes.append(f"Plotting failed: {e}")
+    # Optional plotting of E/mm with rolling std-dev
+    if e_per_mm_plot:
+        try:
+            _plot_e_per_mm(summary, out_path=path.with_suffix('.e_per_mm.png'))
+        except Exception as e:
+            summary.notes.append(f"E/mm plotting failed: {e}")
+    # Optional plotting of volumetric flow (mm^3/s)
+    if flow_plot:
+        try:
+            _plot_volumetric_flow(summary, out_path=path.with_suffix('.flow.png'))
+        except Exception as e:
+            summary.notes.append(f"Flow plotting failed: {e}")
+    # Optional plotting of corner stress index
+    if corner_stress_plot:
+        try:
+            _plot_corner_stress(summary, out_path=path.with_suffix('.corner_stress.png'))
+        except Exception as e:
+            summary.notes.append(f"Corner stress plotting failed: {e}")
+    # Optional cooling plot (fan vs layer time)
+    if cooling_plot:
+        try:
+            _plot_cooling_state(summary, out_path=path.with_suffix('.cooling.png'))
+        except Exception as e:
+            summary.notes.append(f"Cooling plotting failed: {e}")
     # Capture report into a string
     old_stdout = sys.stdout
     try:
@@ -1919,6 +2916,7 @@ def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer
 
 def main(argv: List[str]) -> int:
     used_dialog = False
+    show_post_prompt = True
     paths: List[Path] = []
     # Defaults for CLI-related options so they exist regardless of branch
     filament_diameter = 1.75
@@ -1926,7 +2924,12 @@ def main(argv: List[str]) -> int:
     jobs: Optional[int] = None
     recursive = False
     plot = False
+    e_per_mm_plot = False
+    flow_plot = False
+    corner_stress_plot = False
+    cooling_plot = False
     interactive_prompt = False
+    flow_limit_override: Optional[float] = None
     # Whether to suppress the final hold/pause screen
     no_hold = False
     # Lightweight arg parsing: first non-flag is file path
@@ -1954,7 +2957,36 @@ def main(argv: List[str]) -> int:
                     pass
                 _final_hold()
                 return 2
+            # Ensure we don't keep a hidden root window alive
+            try:
+                root.update_idletasks(); root.destroy()
+            except Exception:
+                pass
             paths = [Path(sel)]
+            # Show an options dialog to select plots and overrides
+            try:
+                ok, opts = _show_options_dialog(default_filament=filament_diameter)
+            except Exception:
+                ok, opts = True, {}
+            if not ok:
+                _final_hold()
+                return 2
+            try:
+                fd = opts.get("filament_diameter")
+                if isinstance(fd, (int, float)):
+                    filament_diameter = float(fd)
+            except Exception:
+                pass
+            po = opts.get("printer_override")
+            if isinstance(po, str) and po:
+                printer_override = po
+            plot = bool(opts.get("plot", plot))
+            flow_plot = bool(opts.get("flow", flow_plot))
+            e_per_mm_plot = bool(opts.get("e_per_mm", e_per_mm_plot))
+            corner_stress_plot = bool(opts.get("corner_stress", corner_stress_plot))
+            cooling_plot = bool(opts.get("cooling", cooling_plot))
+            # Suppress extra post-run prompt when options were shown
+            show_post_prompt = False
         except Exception:
             print(USAGE)
             _final_hold()
@@ -1975,6 +3007,22 @@ def main(argv: List[str]) -> int:
                 plot = True
                 i += 1
                 continue
+            if tok == "--e-per-mm":
+                e_per_mm_plot = True
+                i += 1
+                continue
+            if tok == "--flow":
+                flow_plot = True
+                i += 1
+                continue
+            if tok == "--corner-stress":
+                corner_stress_plot = True
+                i += 1
+                continue
+            if tok == "--cooling":
+                cooling_plot = True
+                i += 1
+                continue
             if tok == "--interactive":
                 interactive_prompt = True
                 i += 1
@@ -1993,6 +3041,13 @@ def main(argv: List[str]) -> int:
                         printer_override = key
                 except Exception:
                     print("Invalid --printer value; expected one of: A1, P1S, X1C, H2D, H2S")
+                i += 2
+                continue
+            if tok == "--flow-limit" and i + 1 < len(args):
+                try:
+                    flow_limit_override = float(args[i + 1])
+                except Exception:
+                    print("Invalid --flow-limit value; expected mm^3/s number")
                 i += 2
                 continue
             if tok in {"-j", "--jobs"} and i + 1 < len(args):
@@ -2045,7 +3100,7 @@ def main(argv: List[str]) -> int:
         except Exception:
             pass
         try:
-            out = _analyze_single_file_with_opts(target, filament_diameter, printer_override, plot=plot)
+            out = _analyze_single_file_with_opts(target, filament_diameter, printer_override, plot=plot, e_per_mm_plot=e_per_mm_plot, flow_plot=flow_plot, corner_stress_plot=corner_stress_plot, cooling_plot=cooling_plot, flow_limit_override=flow_limit_override)
             print(out, end="")
         except Exception as e:
             msg = f"Error analyzing file: {e}"
@@ -2061,7 +3116,7 @@ def main(argv: List[str]) -> int:
             _final_hold()
             return 1
         # Show optional interactive prompt either when launched via picker or when --interactive is passed
-        if used_dialog or interactive_prompt:
+        if show_post_prompt and (used_dialog or interactive_prompt):
             handled = False
             # In picker mode, prefer a GUI prompt so double-clicking .py doesn't close immediately
             if used_dialog:
@@ -2090,19 +3145,34 @@ def main(argv: List[str]) -> int:
             if not handled:
                 # Fallback to console prompt (works in terminals or when --interactive is passed)
                 try:
-                    print("\nPress P to save layer plot (PNG), or any other key to exit... ", end="", flush=True)
-                    choice = _read_single_key()
-                    print("")
-                    if (choice or "").lower() == 'p':
+                    print("\nHotkeys — L: layer, F: flow, E: E/mm, K: corner, O: cooling, any other to quit", flush=True)
+                    while True:
+                        print("Select plot (L/F/E/K/O) or any other key to exit: ", end="", flush=True)
+                        choice = _read_single_key()
+                        print("")
+                        ch = (choice or "").strip().lower()
+                        if ch not in {"l", "f", "e", "k", "o"}:
+                            break
                         inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
                         with target.open("r", encoding="utf-8", errors="ignore") as fh:
                             summary = inspector.inspect(fh, filename=target)
                         try:
-                            out_path = _plot_layer_metrics(summary, out_path=target.with_suffix('.layer_metrics.png'))
+                            if ch == "l":
+                                out_path = _plot_layer_metrics(summary, out_path=target.with_suffix('.layer_metrics.png'))
+                            elif ch == "f":
+                                out_path = _plot_volumetric_flow(summary, out_path=target.with_suffix('.flow.png'))
+                            elif ch == "e":
+                                out_path = _plot_e_per_mm(summary, out_path=target.with_suffix('.e_per_mm.png'))
+                            elif ch == "k":
+                                out_path = _plot_corner_stress(summary, out_path=target.with_suffix('.corner_stress.png'))
+                            elif ch == "o":
+                                out_path = _plot_cooling_state(summary, out_path=target.with_suffix('.cooling.png'))
+                            else:
+                                out_path = None
                             if out_path:
                                 print(f"Saved: {out_path}")
                             else:
-                                print("No per-layer data to plot.")
+                                print("Nothing to plot or failed.")
                         except Exception as e:
                             print(f"Plotting failed: {e}")
                 except Exception:
@@ -2110,6 +3180,10 @@ def main(argv: List[str]) -> int:
             # In picker mode, add a final hold to prevent the console from closing immediately
             if used_dialog and not no_hold:
                 _final_hold()
+        # If launched via options dialog (used_dialog True) and we suppressed the post prompt,
+        # show a standard "press any key" hold to allow reading the output.
+        elif used_dialog and not show_post_prompt:
+            _final_hold()
         # If launched by drag-and-drop onto .py (no picker, no --interactive), the console window
         # may close immediately; add a final hold when not attached to a TTY.
         if not used_dialog and not interactive_prompt and _should_hold() and not no_hold:
@@ -2122,7 +3196,7 @@ def main(argv: List[str]) -> int:
     max_workers = jobs or min(32, (os.cpu_count() or 4))
     results: List[Tuple[Path, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_analyze_single_file_with_opts, p, filament_diameter, printer_override, plot, False): p for p in expanded}
+        futs = {ex.submit(_analyze_single_file_with_opts, p, filament_diameter, printer_override, plot, False, e_per_mm_plot, flow_plot, corner_stress_plot, cooling_plot, flow_limit_override): p for p in expanded}
         for fut in as_completed(futs):
             p = futs[fut]
             try:

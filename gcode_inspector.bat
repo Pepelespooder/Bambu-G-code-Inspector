@@ -11,6 +11,9 @@ if "%~1"=="" (
   echo Drag-and-drop a .gcode file onto this file, or run:
   echo   %PYTHON% "%SCRIPT_DIR%gcode_inspector.py" "path\to\file.gcode"
   echo.
+  echo When run via this .BAT, an interactive hotkey menu is available:
+  echo   L: Layer metrics   F: Flow   E: E^/mm   K: Corner stress   O: Cooling
+  echo.
   pause
   exit /b 1
 )
