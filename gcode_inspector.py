@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 
-
 from __future__ import annotations
+
+USAGE = (
+    "G-code Inspector\n\n"
+    "Usage:\n"
+    "  python gcode_inspector.py <path-to-file.gcode> [--filament-diameter 1.75] [--plot] [--interactive]\n\n"
+    "Notes:\n"
+    "  - Drag-and-drop onto this .py or .bat is supported.\n"
+    "  - Use --plot to save a per-layer metrics PNG.\n"
+)
 
 import math
 import ast
@@ -10,6 +18,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+# Matplotlib is optional; import lazily where needed
 
 
 # ---------------------------- Parsing Utilities ---------------------------- #
@@ -38,6 +48,11 @@ TYPE_BRIDGE_RE = re.compile(r"type:bridge", re.IGNORECASE)
 TYPE_SKIRT_BRIM_RE = re.compile(r"type:(skirt|brim)", re.IGNORECASE)
 MATERIAL_RE = re.compile(r"(?<![A-Za-z])(pla|petg|abs|asa|tpu|nylon|pc|hips|pa|pet)(?![A-Za-z])", re.IGNORECASE)
 DIAMETER_RE = re.compile(fr"(\b(1\.75|2\.85|3\.00)\b\s*mm)|diameter\s*({float_re})", re.IGNORECASE)
+LAYER_INDEX_RE = re.compile(r"\blayer\s*:?\s*(\d+)\b|^layer:(\d+)", re.IGNORECASE)
+BAMBU_LAYER_PROGRESS_RE = re.compile(r"layer\s+num/total_layer_count\s*:\s*(\d+)/", re.IGNORECASE)
+
+# Sentinel to ensure we only try to auto-install matplotlib once per process
+_MPL_TRIED_INSTALL = False
 
 # Printer model detection patterns
 PRN_PATS: List[Tuple[re.Pattern[str], str]] = [
@@ -198,10 +213,20 @@ class HeuristicStats:
     max_volumetric_first_layer_mm3_s: Optional[float] = None
     avg_volumetric_mm3_s: Optional[float] = None
     avg_volumetric_first_layer_mm3_s: Optional[float] = None
+    # First-layer dynamics (accel/jerk)
+    fl_accel_print_max: Optional[float] = None  # from M204 P or S
+    fl_accel_travel_max: Optional[float] = None  # from M204 T or S
+    fl_jerk_x_max: Optional[float] = None  # from M205 X
+    fl_jerk_y_max: Optional[float] = None  # from M205 Y
+    fl_jerk_z_max: Optional[float] = None  # from M205 Z
+    fl_jerk_e_max: Optional[float] = None  # from M205 E
     printer_model: Optional[str] = None  # e.g., bambu_a1, bambu_p1s, bambu_x1c, bambu_h2d, bambu_h2s
     # Bed leveling state tracking
     bed_leveling_enabled_current: Optional[bool] = None
     bed_leveling_enabled_at_first_layer: Optional[bool] = None
+    # Per-layer aggregates
+    layer_move_mm: Dict[int, float] = field(default_factory=dict)
+    layer_time_s: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -233,6 +258,13 @@ class GcodeSummary:
     estimated_time_total_s: Optional[int] = None
     model_print_time_s: Optional[int] = None
     max_z_height_mm: Optional[float] = None
+    # Layer aggregates (distance/time)
+    avg_layer_move_mm: Optional[float] = None
+    first_layer_move_mm: Optional[float] = None
+    last_layer_move_mm: Optional[float] = None
+    avg_layer_time_s: Optional[float] = None
+    first_layer_time_s: Optional[float] = None
+    last_layer_time_s: Optional[float] = None
 
 
 # ------------------------------ Core Parser ------------------------------- #
@@ -284,6 +316,7 @@ class GcodeInspector:
         # Movement tracking
         last_x: Optional[float] = None
         last_y: Optional[float] = None
+        current_layer_index: Optional[int] = None
         # Retraction/travel pattern tracking
         retracted_since_last_extrude = True
         heur = HeuristicStats()
@@ -353,6 +386,7 @@ class GcodeInspector:
                     saw_layer0 = True
                     in_first_layer = True
                     in_print_phase = True
+                    current_layer_index = 0
                     heur.first_layer_found = True
                     # Record bed leveling state at start of print
                     heur.bed_leveling_enabled_at_first_layer = heur.bed_leveling_enabled_current
@@ -373,6 +407,30 @@ class GcodeInspector:
                 # Detect end of first layer when next layer begins (LAYER:1 or Bambu 2/XXX)
                 if in_first_layer and (LAYER1_RE.search(lc) or BAMBU_LAYER2_RE.search(lc)):
                     in_first_layer = False
+
+                # Update current layer index from generic markers
+                mli = LAYER_INDEX_RE.search(lc)
+                if mli:
+                    try:
+                        idx = int(mli.group(1) or mli.group(2))
+                        current_layer_index = idx
+                        in_print_phase = True
+                        if idx == 0 and not heur.first_layer_found:
+                            heur.first_layer_found = True
+                        
+                    except Exception:
+                        pass
+                else:
+                    mb = BAMBU_LAYER_PROGRESS_RE.search(lc)
+                    if mb:
+                        try:
+                            n = int(mb.group(1))
+                            current_layer_index = max(0, n - 1)
+                            in_print_phase = True
+                            if current_layer_index == 0 and not heur.first_layer_found:
+                                heur.first_layer_found = True
+                        except Exception:
+                            pass
 
                 # Detect printer model tokens in free comments
                 pm = self._detect_printer_model(lc)
@@ -495,6 +553,39 @@ class GcodeInspector:
                         current_chamber_setpoint = s
                         if in_print_phase and not end_print_detected and s >= 20:
                             temps.chamber_print_setpoints.append(s)
+                elif word0 == "M204":
+                    # Acceleration settings: S=default/print, P=print, T=travel (Marlin style)
+                    s = parse_word(code, "S")
+                    p = parse_word(code, "P")
+                    t = parse_word(code, "T")
+                    if in_first_layer:
+                        val_p = p or s
+                        val_t = t or s
+                        if val_p is not None:
+                            if heur.fl_accel_print_max is None:
+                                heur.fl_accel_print_max = val_p
+                            else:
+                                heur.fl_accel_print_max = max(heur.fl_accel_print_max, val_p)
+                        if val_t is not None:
+                            if heur.fl_accel_travel_max is None:
+                                heur.fl_accel_travel_max = val_t
+                            else:
+                                heur.fl_accel_travel_max = max(heur.fl_accel_travel_max, val_t)
+                elif word0 == "M205":
+                    # Jerk settings: X/Y/Z/E values in mm/s on many firmwares
+                    if in_first_layer:
+                        jx = parse_word(code, "X")
+                        jy = parse_word(code, "Y")
+                        jz = parse_word(code, "Z")
+                        je = parse_word(code, "E")
+                        if jx is not None:
+                            heur.fl_jerk_x_max = jx if heur.fl_jerk_x_max is None else max(heur.fl_jerk_x_max, jx)
+                        if jy is not None:
+                            heur.fl_jerk_y_max = jy if heur.fl_jerk_y_max is None else max(heur.fl_jerk_y_max, jy)
+                        if jz is not None:
+                            heur.fl_jerk_z_max = jz if heur.fl_jerk_z_max is None else max(heur.fl_jerk_z_max, jz)
+                        if je is not None:
+                            heur.fl_jerk_e_max = je if heur.fl_jerk_e_max is None else max(heur.fl_jerk_e_max, je)
 
             if word0 in {"M106", "M107"}:
                 if word0 == "M107":
@@ -553,17 +644,22 @@ class GcodeInspector:
                 z = parse_word(code, "Z")
                 e = parse_word(code, "E")
 
+                # Track Z movement distance for timing
+                z_dist = 0.0
                 if z is not None:
                     # For absolute positioning, Z is absolute; for relative G91 Z is delta
                     if absolute_positioning:
-                        if z > last_z:
-                            # Treat layer changes and z-hop detection heuristically
-                            pass
+                        try:
+                            z_dist = abs(z - last_z)
+                        except Exception:
+                            z_dist = 0.0
+                        # Treat layer changes and z-hop detection heuristically
                         last_z = z
                     else:
                         if z > 0:
                             # relative z up movement could be z-hop
                             retraction.z_hops += 1
+                        z_dist = abs(z)
                         last_z += z
 
                 # Compute XY travel distance for this move
@@ -653,6 +749,21 @@ class GcodeInspector:
                     if xy_dist >= 5.0:  # threshold for significant travel
                         heur.travel_no_retract_count += 1
                         heur.max_travel_no_retract_mm = max(heur.max_travel_no_retract_mm, xy_dist)
+
+                # Per-layer aggregates (distance and time)
+                if in_print_phase and current_layer_index is not None:
+                    if xy_dist > 0.0:
+                        heur.layer_move_mm[current_layer_index] = heur.layer_move_mm.get(current_layer_index, 0.0) + xy_dist
+                    if last_feed is not None:
+                        speed_mms = last_feed / 60.0
+                        if speed_mms > 0.0:
+                            seg_t = 0.0
+                            if xy_dist > 0.0:
+                                seg_t += xy_dist / speed_mms
+                            if z_dist > 0.0:
+                                seg_t += z_dist / speed_mms
+                            if seg_t > 0.0:
+                                heur.layer_time_s[current_layer_index] = heur.layer_time_s.get(current_layer_index, 0.0) + seg_t
 
         # Post-process slicer hints
         # Also check common keys for printer model
@@ -872,6 +983,28 @@ class GcodeInspector:
             if temps.first_layer_chamber is None:
                 temps.first_layer_chamber = chamber_header_value
 
+        # Layer aggregates: compute averages and first/last
+        avg_layer_move_mm: Optional[float] = None
+        first_layer_move_mm: Optional[float] = None
+        last_layer_move_mm: Optional[float] = None
+        avg_layer_time_s: Optional[float] = None
+        first_layer_time_s: Optional[float] = None
+        last_layer_time_s: Optional[float] = None
+        if heur.layer_move_mm:
+            keys = sorted(heur.layer_move_mm.keys())
+            vals = [heur.layer_move_mm[k] for k in keys]
+            if vals:
+                avg_layer_move_mm = sum(vals) / len(vals)
+                first_layer_move_mm = heur.layer_move_mm.get(0, heur.layer_move_mm.get(keys[0]))
+                last_layer_move_mm = heur.layer_move_mm.get(keys[-1])
+        if heur.layer_time_s:
+            tkeys = sorted(heur.layer_time_s.keys())
+            tvals = [heur.layer_time_s[k] for k in tkeys]
+            if tvals:
+                avg_layer_time_s = sum(tvals) / len(tvals)
+                first_layer_time_s = heur.layer_time_s.get(0, heur.layer_time_s.get(tkeys[0]))
+                last_layer_time_s = heur.layer_time_s.get(tkeys[-1])
+
         summary = GcodeSummary(
             file=filename or Path("<stdin>"),
             filament_diameter_mm=self.filament_diameter_mm,
@@ -897,6 +1030,12 @@ class GcodeInspector:
             estimated_time_total_s=estimated_time_total_s,
             model_print_time_s=model_print_time_s,
             max_z_height_mm=max_z_height_mm,
+            avg_layer_move_mm=avg_layer_move_mm,
+            first_layer_move_mm=first_layer_move_mm,
+            last_layer_move_mm=last_layer_move_mm,
+            avg_layer_time_s=avg_layer_time_s,
+            first_layer_time_s=first_layer_time_s,
+            last_layer_time_s=last_layer_time_s,
         )
 
         # Attach slicer estimate summary into notes for now to avoid struct churn
@@ -924,6 +1063,8 @@ class GcodeInspector:
             if pat.search(t):
                 return key
         return None
+
+    
 
     @staticmethod
     def _infer_material(
@@ -1329,6 +1470,60 @@ def print_report(summary: GcodeSummary) -> None:
     if ch_list:
         print(f"- Avg chamber: {cavg}")
     print("")
+    # Layer metrics (distance and time)
+    if summary.heuristics and (summary.heuristics.layer_move_mm or summary.heuristics.layer_time_s):
+        def _fmt_time_short(seconds: Optional[float]) -> str:
+            if seconds is None:
+                return "-"
+            s = int(round(seconds))
+            m = s // 60
+            s = s % 60
+            if m:
+                return f"{m}m {s}s"
+            return f"{s}s"
+        print("Layer Metrics")
+        if summary.avg_layer_move_mm is not None:
+            print(f"- Avg movement/layer: {summary.avg_layer_move_mm:.1f} mm")
+            print(f"- First layer movement: {fmt_float(summary.first_layer_move_mm, ' mm', 1)}")
+            print(f"- Last layer movement: {fmt_float(summary.last_layer_move_mm, ' mm', 1)}")
+        if summary.avg_layer_time_s is not None:
+            print(f"- Avg time/layer: {_fmt_time_short(summary.avg_layer_time_s)}")
+            print(f"- First layer time: {_fmt_time_short(summary.first_layer_time_s)}")
+            print(f"- Last layer time: {_fmt_time_short(summary.last_layer_time_s)}")
+        # Show significant consecutive deltas (distance/time)
+        lm = summary.heuristics.layer_move_mm
+        lt = summary.heuristics.layer_time_s
+        if lm:
+            keys = sorted(lm.keys())
+            vals = [lm[k] for k in keys]
+            avg_mv = sum(vals) / len(vals)
+            sigs: List[str] = []
+            for i in range(1, len(keys)):
+                a, b = vals[i-1], vals[i]
+                d = b - a
+                p = (abs(d) / max(1e-6, a)) * 100.0 if a > 0 else 0.0
+                if abs(d) > max(0.1 * avg_mv, 50.0) and p > 40.0:
+                    sigs.append(f"L{keys[i-1]}→L{keys[i]}: {d:+.0f} mm ({p:.0f}%)")
+            if sigs:
+                print("- Significant movement jumps:")
+                for s in sigs[:10]:
+                    print(f"  • {s}")
+        if lt:
+            keys = sorted(lt.keys())
+            vals = [lt[k] for k in keys]
+            avg_t = sum(vals) / len(vals)
+            sigs: List[str] = []
+            for i in range(1, len(keys)):
+                a, b = vals[i-1], vals[i]
+                d = b - a
+                p = (abs(d) / max(1e-6, a)) * 100.0 if a > 0 else 0.0
+                if abs(d) > max(0.1 * avg_t, 10.0) and p > 40.0:
+                    sigs.append(f"L{keys[i-1]}→L{keys[i]}: {int(d):+d} s ({p:.0f}%)")
+            if sigs:
+                print("- Significant time jumps:")
+                for s in sigs[:10]:
+                    print(f"  • {s}")
+        print("")
     print("Retraction")
     print(f"- Samples: {len(summary.retraction.samples)}")
     print(f"- Avg distance: {fmt_float(summary.retraction.avg_distance, ' mm', 2)}")
@@ -1354,6 +1549,16 @@ def print_report(summary: GcodeSummary) -> None:
         print(f"- 1st-layer max extrusion: {fmt_float(hl.first_layer_extrusion_max_mms, ' mm/s', 1)}")
         print(f"- 1st-layer avg travel: {fmt_float(avg_fl_trv, ' mm/s', 1)}")
         print(f"- 1st-layer max travel: {fmt_float(hl.first_layer_travel_max_mms, ' mm/s', 1)}")
+        # First-layer dynamics
+        if hl.fl_accel_print_max is not None or hl.fl_accel_travel_max is not None or any(
+            v is not None for v in (hl.fl_jerk_x_max, hl.fl_jerk_y_max, hl.fl_jerk_z_max, hl.fl_jerk_e_max)
+        ):
+            print(f"- 1st-layer accel (print/travel): {fmt_float(hl.fl_accel_print_max, ' mm/s^2', 0)} / {fmt_float(hl.fl_accel_travel_max, ' mm/s^2', 0)}")
+            jx = fmt_float(hl.fl_jerk_x_max, ' mm/s', 1)
+            jy = fmt_float(hl.fl_jerk_y_max, ' mm/s', 1)
+            jz = fmt_float(hl.fl_jerk_z_max, ' mm/s', 1)
+            je = fmt_float(hl.fl_jerk_e_max, ' mm/s', 1)
+            print(f"- 1st-layer jerk X/Y/Z/E: {jx} / {jy} / {jz} / {je}")
     print("")
     # Volumetric flow
     if summary.heuristics and (
@@ -1422,6 +1627,203 @@ def print_report(summary: GcodeSummary) -> None:
             print(f"- {n}")
 
 
+def _read_single_key() -> Optional[str]:
+    """Read a single key without requiring Enter on Windows; fall back to input().
+    Returns the character pressed, or None if unavailable.
+    """
+    try:
+        import msvcrt  # type: ignore
+        ch = msvcrt.getwch()
+        return ch
+    except Exception:
+        try:
+            s = input()
+            return s[:1] if s else "\n"
+        except Exception:
+            return None
+
+
+def _final_hold(prompt: str = "Press any key to exit...") -> None:
+    """Block until a keypress using best available method to prevent window auto-close.
+
+    Works both when a console is attached and when launched without a console
+    (e.g., double-clicking/drag-dropping onto the .py on Windows).
+    """
+    # First, try Windows console without requiring Enter
+    try:
+        import msvcrt  # type: ignore
+        try:
+            print(prompt, end="", flush=True)
+        except Exception:
+            pass
+        try:
+            msvcrt.getwch()
+        except Exception:
+            try:
+                msvcrt.getch()
+            except Exception:
+                # Fall through to other strategies
+                raise
+        try:
+            print("")
+        except Exception:
+            pass
+        return
+    except Exception:
+        # Not on Windows or no console available
+        pass
+
+    # Next, try standard input (console requiring Enter)
+    try:
+        try:
+            # Ensure prompt is visible in typical consoles
+            print(prompt)
+        except Exception:
+            pass
+        _ = input()
+        return
+    except Exception:
+        # No stdin or input() not possible (pythonw.exe)
+        pass
+
+    # Last resort: GUI dialog that requires user to close
+    try:
+        import tkinter as tk  # type: ignore
+        from tkinter import messagebox  # type: ignore
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("G-code Inspector", "Close this window to exit.")
+    except Exception:
+        # If even this fails, nothing else we can do
+        pass
+
+
+def _should_hold() -> bool:
+    """Heuristic: return True if likely launched without an interactive TTY.
+
+    Used for non-error paths where we optionally hold to keep the window open.
+    """
+    try:
+        return not (hasattr(sys, 'stdin') and sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return True
+
+
+def _plot_layer_metrics(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
+    # No-op if no layer metrics
+    heur = summary.heuristics
+    if not heur or (not heur.layer_move_mm and not heur.layer_time_s):
+        return None
+    # Ensure matplotlib is available; on ImportError, try one-time install
+    plt = _ensure_matplotlib()
+    if plt is None:
+        # Could not import/install; record note and exit quietly
+        summary.notes.append("Matplotlib not available; skipping plot.")
+        return None
+
+    # Prepare series
+    layers = sorted(set(list(heur.layer_move_mm.keys()) + list(heur.layer_time_s.keys())))
+    move = [heur.layer_move_mm.get(i, float('nan')) for i in layers]
+    times = [heur.layer_time_s.get(i, float('nan')) for i in layers]
+
+    # Compute significant jumps
+    def sig_mask(vals: List[float], abs_min: float, pct_min: float) -> List[bool]:
+        mask = [False] * len(vals)
+        # Use previous non-nan for baseline
+        prev_idx = None
+        for i, v in enumerate(vals):
+            if i == 0 or not (isinstance(v, float) and not math.isnan(v)):
+                if isinstance(v, float) and not math.isnan(v):
+                    prev_idx = i
+                continue
+            if prev_idx is None or math.isnan(vals[prev_idx]):
+                prev_idx = i
+                continue
+            a, b = vals[prev_idx], v
+            d = b - a
+            p = (abs(d) / a * 100.0) if a > 0 else 0.0
+            if abs(d) > abs_min and p > pct_min:
+                mask[i] = True
+            prev_idx = i
+        return mask
+
+    # Thresholds
+    mv_vals = [v for v in move if isinstance(v, float) and not math.isnan(v)]
+    t_vals = [v for v in times if isinstance(v, float) and not math.isnan(v)]
+    mv_avg = sum(mv_vals) / len(mv_vals) if mv_vals else 0.0
+    t_avg = sum(t_vals) / len(t_vals) if t_vals else 0.0
+    mv_mask = sig_mask(move, abs_min=max(0.1 * mv_avg, 50.0), pct_min=40.0)
+    t_mask = sig_mask(times, abs_min=max(0.1 * t_avg, 10.0), pct_min=40.0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    ax1, ax2 = axes
+    ax1.plot(layers, move, label="Movement (mm)", color="#1f77b4")
+    # Highlight significant points
+    sig_layers = [layers[i] for i, m in enumerate(mv_mask) if m]
+    sig_vals = [move[i] for i, m in enumerate(mv_mask) if m]
+    if sig_layers:
+        ax1.scatter(sig_layers, sig_vals, color="red", zorder=3, label="Significant jump")
+    ax1.set_ylabel("Movement (mm)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2.plot(layers, [v/60.0 if isinstance(v, float) and not math.isnan(v) else float('nan') for v in times],
+             label="Time (min)", color="#2ca02c")
+    sig_layers_t = [layers[i] for i, m in enumerate(t_mask) if m]
+    sig_vals_t = [times[i]/60.0 for i, m in enumerate(t_mask) if m]
+    if sig_layers_t:
+        ax2.scatter(sig_layers_t, sig_vals_t, color="red", zorder=3, label="Significant jump")
+    ax2.set_xlabel("Layer index")
+    ax2.set_ylabel("Time (min)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    fig.suptitle(f"Layer metrics: {summary.file.stem}")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    if out_path is None:
+        out_path = summary.file.with_suffix('.layer_metrics.png')
+    fig.savefig(out_path)
+    plt.close(fig)
+    # Attach note
+    summary.notes.append(f"Saved layer metrics plot: {out_path.name}")
+    return out_path
+
+
+def _ensure_matplotlib():  # returns pyplot module or None
+    global _MPL_TRIED_INSTALL
+    try:
+        import matplotlib
+        try:
+            matplotlib.use("Agg", force=True)
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt  # type: ignore
+        return plt
+    except Exception:
+        # Try a one-time install
+        if _MPL_TRIED_INSTALL:
+            return None
+        _MPL_TRIED_INSTALL = True
+        try:
+            import subprocess, sys
+            # Best-effort user install without polluting system site-packages
+            cmd = [sys.executable, "-m", "pip", "install", "--user", "matplotlib"]
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Re-try import
+            import importlib
+            importlib.invalidate_caches()
+            import matplotlib
+            try:
+                matplotlib.use("Agg", force=True)
+            except Exception:
+                pass
+            import matplotlib.pyplot as plt  # type: ignore
+            return plt
+        except Exception:
+            return None
+
+
 def _gcode_file_list_from_arg(path: Path, recursive: bool = False) -> List[Path]:
     if path.is_file():
         return [path]
@@ -1433,11 +1835,22 @@ def _gcode_file_list_from_arg(path: Path, recursive: bool = False) -> List[Path]
 
 
 def _analyze_single_file(path: Path, filament_diameter: float, printer_override: Optional[str]) -> str:
+    return _analyze_single_file_with_opts(path, filament_diameter, printer_override, plot=False)
+
+
+def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer_override: Optional[str], plot: bool = False) -> str:
     from io import StringIO
     buf = StringIO()
     inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
     with path.open("r", encoding="utf-8", errors="ignore") as fh:
         summary = inspector.inspect(fh, filename=path)
+    # Optional plotting of per-layer metrics
+    if plot:
+        try:
+            _plot_layer_metrics(summary, out_path=path.with_suffix('.layer_metrics.png'))
+        except Exception as e:
+            # Non-fatal; include a note
+            summary.notes.append(f"Plotting failed: {e}")
     # Capture report into a string
     old_stdout = sys.stdout
     try:
@@ -1451,15 +1864,25 @@ def _analyze_single_file(path: Path, filament_diameter: float, printer_override:
 def main(argv: List[str]) -> int:
     used_dialog = False
     paths: List[Path] = []
+    # Defaults for CLI-related options so they exist regardless of branch
+    filament_diameter = 1.75
+    printer_override: Optional[str] = None
+    jobs: Optional[int] = None
+    recursive = False
+    plot = False
+    interactive_prompt = False
+    # Whether to suppress the final hold/pause screen
+    no_hold = False
     # Lightweight arg parsing: first non-flag is file path
     if len(argv) < 2:
         # Try interactive file picker (helps when double-clicking on Windows)
         try:
             import tkinter as tk  # type: ignore
-            from tkinter import filedialog  # type: ignore
+            from tkinter import filedialog, messagebox  # type: ignore
 
             root = tk.Tk()
             root.withdraw()
+            used_dialog = True  # mark early so we can perform a hold on cancel
             sel = filedialog.askopenfilename(
                 title="Select a G-code file",
                 filetypes=[
@@ -1468,20 +1891,21 @@ def main(argv: List[str]) -> int:
                 ],
             )
             if not sel:
-                print(__doc__)
+                # Inform and hold so double-click doesn't close instantly
+                try:
+                    messagebox.showinfo("G-code Inspector", "No file selected.")
+                except Exception:
+                    pass
+                _final_hold()
                 return 2
             paths = [Path(sel)]
-            used_dialog = True
         except Exception:
-            print(__doc__)
+            print(USAGE)
+            _final_hold()
             return 2
     else:
         args = argv[1:]
         i = 0
-        filament_diameter = 1.75
-        printer_override: Optional[str] = None
-        jobs: Optional[int] = None
-        recursive = False
         while i < len(args):
             tok = args[i]
             if tok == "--filament-diameter" and i + 1 < len(args):
@@ -1490,6 +1914,18 @@ def main(argv: List[str]) -> int:
                 except Exception:
                     print("Invalid --filament-diameter value; using default 1.75 mm")
                 i += 2
+                continue
+            if tok == "--plot":
+                plot = True
+                i += 1
+                continue
+            if tok == "--interactive":
+                interactive_prompt = True
+                i += 1
+                continue
+            if tok == "--no-hold":
+                no_hold = True
+                i += 1
                 continue
             if tok == "--printer" and i + 1 < len(args):
                 try:
@@ -1517,14 +1953,20 @@ def main(argv: List[str]) -> int:
             if not tok.startswith("-"):
                 paths.append(Path(tok))
             i += 1
-        # Fallback defaults if not set above
-        if 'filament_diameter' not in locals():
-            filament_diameter = 1.75
-        if 'printer_override' not in locals():
-            printer_override = None
+        # Heuristic: if no usable paths parsed but there are non-flag tokens, try joining them
+        if not paths:
+            nonflags = [t for t in args if not t.startswith("-")]
+            if nonflags:
+                joined = " ".join(nonflags).strip().strip('"')
+                if joined:
+                    p = Path(joined)
+                    if p.exists():
+                        paths.append(p)
     # Expand directories and validate paths
     if not paths:
         print("Error: no files provided")
+        if _should_hold():
+            _final_hold()
         return 2
     expanded: List[Path] = []
     for p in paths:
@@ -1534,17 +1976,88 @@ def main(argv: List[str]) -> int:
         expanded.extend(_gcode_file_list_from_arg(p, recursive=recursive))
     if not expanded:
         print("Error: no G-code files to analyze")
+        if _should_hold():
+            _final_hold()
         return 2
 
     # Single file path → preserve existing behavior
     if len(expanded) == 1:
-        out = _analyze_single_file(expanded[0], filament_diameter, printer_override)
-        print(out, end="")
-        if used_dialog:
-            try:
-                input("\nPress Enter to exit...")
-            except Exception:
-                pass
+        target = expanded[0]
+        # Always print the target early so drag-and-drop users see something immediately
+        try:
+            print(f"Analyzing: {target}", flush=True)
+        except Exception:
+            pass
+        try:
+            out = _analyze_single_file_with_opts(target, filament_diameter, printer_override, plot=plot)
+            print(out, end="")
+        except Exception as e:
+            msg = f"Error analyzing file: {e}"
+            print(msg)
+            if used_dialog:
+                try:
+                    import tkinter as tk  # type: ignore
+                    from tkinter import messagebox  # type: ignore
+                    root = tk.Tk(); root.withdraw()
+                    messagebox.showerror("G-code Inspector", msg)
+                except Exception:
+                    pass
+            _final_hold()
+            return 1
+        # Show optional interactive prompt either when launched via picker or when --interactive is passed
+        if used_dialog or interactive_prompt:
+            handled = False
+            # In picker mode, prefer a GUI prompt so double-clicking .py doesn't close immediately
+            if used_dialog:
+                try:
+                    import tkinter as tk  # type: ignore
+                    from tkinter import messagebox  # type: ignore
+                    root = tk.Tk()
+                    root.withdraw()
+                    if messagebox.askyesno("G-code Inspector", "Save layer plot (PNG) now?"):
+                        inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
+                        with target.open("r", encoding="utf-8", errors="ignore") as fh:
+                            summary = inspector.inspect(fh, filename=target)
+                        try:
+                            out_path = _plot_layer_metrics(summary, out_path=target.with_suffix('.layer_metrics.png'))
+                            if out_path:
+                                messagebox.showinfo("G-code Inspector", f"Saved plot to:\n{out_path}")
+                            else:
+                                messagebox.showinfo("G-code Inspector", "No per-layer data to plot.")
+                        except Exception as e:
+                            messagebox.showerror("G-code Inspector", f"Plotting failed:\n{e}")
+                    # Always show a final dismiss to prevent immediate close
+                    messagebox.showinfo("G-code Inspector", "Done.")
+                    handled = True
+                except Exception:
+                    handled = False
+            if not handled:
+                # Fallback to console prompt (works in terminals or when --interactive is passed)
+                try:
+                    print("\nPress P to save layer plot (PNG), or any other key to exit... ", end="", flush=True)
+                    choice = _read_single_key()
+                    print("")
+                    if (choice or "").lower() == 'p':
+                        inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
+                        with target.open("r", encoding="utf-8", errors="ignore") as fh:
+                            summary = inspector.inspect(fh, filename=target)
+                        try:
+                            out_path = _plot_layer_metrics(summary, out_path=target.with_suffix('.layer_metrics.png'))
+                            if out_path:
+                                print(f"Saved: {out_path}")
+                            else:
+                                print("No per-layer data to plot.")
+                        except Exception as e:
+                            print(f"Plotting failed: {e}")
+                except Exception:
+                    pass
+            # In picker mode, add a final hold to prevent the console from closing immediately
+            if used_dialog and not no_hold:
+                _final_hold()
+        # If launched by drag-and-drop onto .py (no picker, no --interactive), the console window
+        # may close immediately; add a final hold when not attached to a TTY.
+        if not used_dialog and not interactive_prompt and _should_hold() and not no_hold:
+            _final_hold()
         return 0
 
     # Multi-file: analyze concurrently using threads
@@ -1553,7 +2066,7 @@ def main(argv: List[str]) -> int:
     max_workers = jobs or min(32, (os.cpu_count() or 4))
     results: List[Tuple[Path, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_analyze_single_file, p, filament_diameter, printer_override): p for p in expanded}
+        futs = {ex.submit(_analyze_single_file_with_opts, p, filament_diameter, printer_override, plot): p for p in expanded}
         for fut in as_completed(futs):
             p = futs[fut]
             try:
@@ -1564,8 +2077,28 @@ def main(argv: List[str]) -> int:
     # Print outputs sorted by filename for determinism
     for _, s in sorted(results, key=lambda t: t[0].name.lower()):
         print(s)
+    if _should_hold() and not no_hold:
+        _final_hold()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    try:
+        exit_code = main(sys.argv)
+    except SystemExit as e:
+        # Preserve explicit SystemExit behavior
+        raise
+    except Exception as e:
+        # Catch any unexpected errors, print traceback, and pause before exit
+        print(f"Fatal error: {e}")
+        try:
+            import traceback
+            traceback.print_exc()
+        except Exception:
+            pass
+        try:
+            _final_hold()
+        except Exception:
+            pass
+        exit_code = 1
+    raise SystemExit(exit_code)

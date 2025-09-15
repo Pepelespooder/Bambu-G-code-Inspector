@@ -15,7 +15,5 @@ if "%~1"=="" (
   exit /b 1
 )
 
-%PYTHON% "%SCRIPT_DIR%gcode_inspector.py" %*
-echo.
-pause
-
+rem Use interactive prompt in Python so we can offer 'P to save PNG'
+%PYTHON% "%SCRIPT_DIR%gcode_inspector.py" --interactive %*
