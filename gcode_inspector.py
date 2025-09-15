@@ -1835,15 +1835,71 @@ def _gcode_file_list_from_arg(path: Path, recursive: bool = False) -> List[Path]
 
 
 def _analyze_single_file(path: Path, filament_diameter: float, printer_override: Optional[str]) -> str:
-    return _analyze_single_file_with_opts(path, filament_diameter, printer_override, plot=False)
+    return _analyze_single_file_with_opts(path, filament_diameter, printer_override, plot=False, show_progress=True)
 
 
-def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer_override: Optional[str], plot: bool = False) -> str:
+def _analyze_single_file_with_opts(path: Path, filament_diameter: float, printer_override: Optional[str], plot: bool = False, show_progress: bool = True) -> str:
     from io import StringIO
     buf = StringIO()
     inspector = GcodeInspector(filament_diameter_mm=filament_diameter, printer_override=printer_override)
+    # Wrap the file iterator with a lightweight progress bar when appropriate
+    total_bytes = None
+    try:
+        total_bytes = path.stat().st_size
+    except Exception:
+        total_bytes = None
+
+    def _progress_wrap(fh):
+        import sys as _sys
+        import time as _time
+        import itertools as _it
+
+        enabled = bool(show_progress) and hasattr(_sys.stderr, "isatty") and _sys.stderr.isatty()
+        if not enabled:
+            for _line in fh:
+                yield _line
+            return
+
+        spinner = _it.cycle("|/-\\")
+        last = 0.0
+
+        def _render(pct: Optional[float]):
+            try:
+                if pct is not None and total_bytes:
+                    pct = max(0.0, min(1.0, pct))
+                    width = 30
+                    filled = int(width * pct)
+                    bar = "#" * filled + "-" * (width - filled)
+                    _sys.stderr.write(f"\rAnalyzing [{bar}] {int(pct*100):3d}%")
+                else:
+                    _sys.stderr.write(f"\rAnalyzing {next(spinner)}")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+
+        for _line in fh:
+            yield _line
+            now = _time.monotonic()
+            if now - last >= 0.1:
+                last = now
+                pos = None
+                try:
+                    # Prefer byte position from the underlying buffer for accurate %
+                    pos = fh.buffer.tell() if hasattr(fh, "buffer") else fh.tell()
+                except Exception:
+                    pos = None
+                _render((pos / float(total_bytes)) if (pos is not None and total_bytes) else None)
+
+        # Finish bar at 100%
+        try:
+            _render(1.0 if total_bytes else None)
+            _sys.stderr.write("\n")
+            _sys.stderr.flush()
+        except Exception:
+            pass
+
     with path.open("r", encoding="utf-8", errors="ignore") as fh:
-        summary = inspector.inspect(fh, filename=path)
+        summary = inspector.inspect(_progress_wrap(fh), filename=path)
     # Optional plotting of per-layer metrics
     if plot:
         try:
@@ -2066,7 +2122,7 @@ def main(argv: List[str]) -> int:
     max_workers = jobs or min(32, (os.cpu_count() or 4))
     results: List[Tuple[Path, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_analyze_single_file_with_opts, p, filament_diameter, printer_override, plot): p for p in expanded}
+        futs = {ex.submit(_analyze_single_file_with_opts, p, filament_diameter, printer_override, plot, False): p for p in expanded}
         for fut in as_completed(futs):
             p = futs[fut]
             try:
