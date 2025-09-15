@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""
-G-code Inspector
 
-Usage:
-  python gcode_inspector.py <path-to-file.gcode> [--filament-diameter 1.75]
-
-Reports:
-  - Estimated filament length, volume, and mass
-  - Inferred material and confidence
-  - Key printer settings detected (temps, speeds, fan, retraction)
-  - Common potential issues inferred from the G-code
-
-Notes:
-  - Parsing is heuristic and slicer/comment dependent; results are best-effort.
-  - Extrusion length estimation supports absolute (M82) and relative (M83) modes.
-"""
 
 from __future__ import annotations
 
