@@ -59,11 +59,26 @@ BAMBU_LAYER_PROGRESS_RE = re.compile(r"layer\s+num/total_layer_count\s*:\s*(\d+)
 _MPL_TRIED_INSTALL = False
 
 # Corner-stress defaults
-CS_ANGLE_MIN_DEG = 35.0       # minimum corner angle to consider
-CS_SEG_MIN_MM = 1.0           # minimum segment length for both sides
-CS_RADIUS_FLOOR_MM = 1.2      # minimum effective radius for heuristic
-CS_STRESS_MIN = 0.15          # ignore tiny stress values to reduce noise
-CS_MARGIN = 1.35              # safety margin when comparing incoming vs. limit
+CS_ANGLE_MIN_DEG = 45.0       # minimum corner angle to consider (stricter)
+CS_SEG_MIN_MM = 1.5           # minimum segment length for both sides (filter infill jitter)
+CS_RADIUS_FLOOR_MM = 1.5      # minimum effective radius for heuristic (less pessimistic)
+CS_STRESS_MIN = 0.25          # ignore tiny stress values to reduce noise
+CS_MARGIN = 1.60              # safety margin when comparing incoming vs. limit
+# Additional gating: require a minimum time on both segments so the head actually reaches speed
+CS_SEG_TIME_MIN_S = 0.02
+
+# Layer-metrics jump detection defaults (tuned to reduce false positives)
+LM_ABS_FLOOR_MM_FACTOR = 0.18     # fraction of median layer move for abs floor
+LM_ABS_FLOOR_MM_MIN = 100.0       # minimum absolute floor for movement jumps
+LM_PCT_MIN = 55.0                 # minimum percent change for movement jumps
+LM_SIGMA_K = 3.5                  # robust z-score threshold on diffs
+LM_MIN_BASELINE_MM = 30.0         # ignore jumps when prior layer movement is tiny
+
+LT_ABS_FLOOR_S_FACTOR = 0.18      # fraction of median layer time for abs floor
+LT_ABS_FLOOR_S_MIN = 15.0         # minimum absolute floor for time jumps
+LT_PCT_MIN = 55.0                 # minimum percent change for time jumps
+LT_SIGMA_K = 3.5                  # robust z-score threshold on diffs
+LT_MIN_BASELINE_S = 5.0           # ignore jumps when prior layer time is tiny
 
 # Printer model detection patterns
 PRN_PATS: List[Tuple[re.Pattern[str], str]] = [
@@ -218,8 +233,8 @@ class HeuristicStats:
     flow_override: Optional[float] = None      # M221 S%
     bed_leveling_disabled: bool = False
     g92_resets: int = 0
-    # Volumetric flow tracking: store (delta_e_mm, time_s, in_first_layer)
-    vol_samples: List[Tuple[float, float, bool]] = field(default_factory=list)
+    # Volumetric flow tracking: store (delta_e_mm, time_s, in_first_layer, abs_time_s)
+    vol_samples: List[Tuple[float, float, bool, float]] = field(default_factory=list)
     max_volumetric_mm3_s: Optional[float] = None
     max_volumetric_first_layer_mm3_s: Optional[float] = None
     avg_volumetric_mm3_s: Optional[float] = None
@@ -253,6 +268,11 @@ class HeuristicStats:
     klipper_scv_current: Optional[float] = None  # from SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY
     # Corner stress samples: (time_s, stress_index, angle_deg, v_in, v_limit, r_est)
     corner_samples: List[Tuple[float, float, float, float, Optional[float], float]] = field(default_factory=list)
+    # Total elapsed time across moves (s)
+    total_time_s: float = 0.0
+    # Timelapse filtering (Bambu/Orca SKIPPABLE timelapse blocks)
+    timelapse_blocks: int = 0
+    timelapse_lines_skipped: int = 0
 
 
 @dataclass
@@ -369,8 +389,13 @@ class GcodeInspector:
         saw_layer0 = False
         in_print_phase = False
         end_print_detected = False
+        # Timelapse skip-block tracking (e.g., Bambu/Orca SKIPPABLE blocks)
+        in_skippable_block = False
+        current_skip_type: Optional[str] = None
 
+        line_no = 0
         for raw in lines:
+            line_no += 1
             line = raw.strip()
             if not line:
                 continue
@@ -381,6 +406,21 @@ class GcodeInspector:
             if comment:
                 cstripped = comment.strip()
                 lc = cstripped.lower()
+                # Detect Bambu/Orca SKIPPABLE blocks and their types
+                if "skippable_start" in lc:
+                    in_skippable_block = True
+                    current_skip_type = None
+                if in_skippable_block and "skiptype" in lc:
+                    # Example: '; SKIPTYPE: timelapse'
+                    m = re.search(r"skiptype\s*:\s*([a-z0-9_\-]+)", lc, re.I)
+                    if m:
+                        current_skip_type = (m.group(1) or "").strip().lower()
+                if "skippable_end" in lc:
+                    # Close block; if it was a timelapse one, count it
+                    if in_skippable_block and (current_skip_type == "timelapse"):
+                        heur.timelapse_blocks += 1
+                    in_skippable_block = False
+                    current_skip_type = None
                 # Bambu Studio / OrcaSlicer header/config blocks
                 if lc.startswith("header_start") or lc.startswith("header_block_start") or lc.startswith("config_block_start"):
                     in_header = True
@@ -515,6 +555,11 @@ class GcodeInspector:
                             commented_diameter = val
                     except Exception:
                         pass
+
+            # If inside a timelapse SKIPPABLE block, skip this line's command analysis entirely
+            if in_skippable_block and (current_skip_type == "timelapse"):
+                heur.timelapse_lines_skipped += 1
+                continue
 
             # Tokenize command
             if not code:
@@ -810,38 +855,65 @@ class GcodeInspector:
                                     dot = vx0 * dx + vy0 * dy
                                     cos_t = max(-1.0, min(1.0, dot / (v0_len * v1_len)))
                                     theta = math.acos(cos_t)
+                                    # Determine turn direction via z-component of cross product to detect continuous curves
+                                    cross_z = vx0 * dy - vy0 * dx
+                                    turn_sign = 0
+                                    if cross_z > 1e-9:
+                                        turn_sign = 1
+                                    elif cross_z < -1e-9:
+                                        turn_sign = -1
+                                    # Track runs of same-sign turning; long runs with moderate average angle are curves, not corners
+                                    if not hasattr(self, "_turn_run"):
+                                        self._turn_run = {"sign": None, "count": 0, "avg": 0.0}
+                                    tr = self._turn_run
+                                    if turn_sign == 0 or tr["sign"] is None or turn_sign != tr["sign"]:
+                                        tr["sign"], tr["count"], tr["avg"] = (turn_sign, 1 if turn_sign != 0 else 0, float(theta) if turn_sign != 0 else 0.0)
+                                    else:
+                                        tr["count"] += 1
+                                        # online mean for theta
+                                        tr["avg"] += (float(theta) - tr["avg"]) / float(max(1, tr["count"]))
                                     # Skip small direction changes; require a more pronounced corner
                                     if theta > math.radians(CS_ANGLE_MIN_DEG):
-                                        # Corner radius estimate (heuristic)
-                                        # Use a slightly larger floor to reflect slicer corner smoothing/arc fitting
-                                        r_est = max(CS_RADIUS_FLOOR_MM, min(pl, v1_len) * abs(math.sin(theta / 2.0)))
-                                        # Limits from accel and Klipper SCV; ignore Marlin jerk (unreliable for this calc)
-                                        a = heur.accel_print_current or 2000.0
-                                        v_acc = math.sqrt(max(0.0, a * r_est))
-                                        v_scv = heur.klipper_scv_current if heur.klipper_scv_current is not None else None
-                                        v_jd = None
-                                        if heur.junction_dev_current is not None and heur.junction_dev_current > 0:
-                                            # Coarse cap using JD and accel; do not scale by angle to avoid over-restricting
-                                            v_jd = math.sqrt(max(0.0, a * heur.junction_dev_current))
-                                        # Aggregate corner limit
-                                        v_candidates = [v for v in (v_acc, v_scv, v_jd) if v is not None and v > 0]
-                                        v_limit = min(v_candidates) if v_candidates else None
-                                        # Cap incoming speed by reachable speed given segment lengths and accel
-                                        # If the segments are short, the toolhead cannot maintain the commanded speed
-                                        v_reach_prev = math.sqrt(max(0.0, 2.0 * a * pl))
-                                        v_reach_cur = math.sqrt(max(0.0, 2.0 * a * v1_len))
-                                        v_in = min(float(pin), v_reach_prev, v_reach_cur)
-                                        angle_factor = abs(math.sin(theta / 2.0))
-                                        margin = CS_MARGIN  # conservative margin to reduce false positives
-                                        if v_limit is not None and v_limit > 0 and v_in > 0:
-                                            stress = (v_in / (v_limit * margin)) * angle_factor
+                                        # Suppress continuous curves: consecutive same-sign turns with moderate per-step angle
+                                        is_curve_run = (self._turn_run.get("count", 0) >= 4 and self._turn_run.get("avg", 0.0) <= math.radians(60.0))
+                                        if is_curve_run:
+                                            pass  # treat as curve, not a corner
                                         else:
-                                            # Fallback: acceleration-only heuristic
-                                            denom = max(1e-3, v_acc)
-                                            stress = (v_in / (denom * margin)) * angle_factor
-                                        # Suppress very low stress values to reduce noise
-                                        if stress >= CS_STRESS_MIN:
-                                            heur.corner_samples.append((t_prev_end, float(stress), math.degrees(theta), v_in, v_limit, r_est))
+                                            # Corner radius estimate (heuristic)
+                                            # Use a slightly larger floor to reflect slicer corner smoothing/arc fitting
+                                            r_est = max(CS_RADIUS_FLOOR_MM, min(pl, v1_len) * abs(math.sin(theta / 2.0)))
+                                            # Limits from accel and Klipper SCV; ignore Marlin jerk (unreliable for this calc)
+                                            a = heur.accel_print_current or 2000.0
+                                            v_acc = math.sqrt(max(0.0, a * r_est))
+                                            v_scv = heur.klipper_scv_current if heur.klipper_scv_current is not None else None
+                                            v_jd = None
+                                            if heur.junction_dev_current is not None and heur.junction_dev_current > 0:
+                                                # Coarse cap using JD and accel; do not scale by angle to avoid over-restricting
+                                                v_jd = math.sqrt(max(0.0, a * heur.junction_dev_current))
+                                            # Aggregate corner limit
+                                            v_candidates = [v for v in (v_acc, v_scv, v_jd) if v is not None and v > 0]
+                                            v_limit = min(v_candidates) if v_candidates else None
+                                            # Cap incoming speed by reachable speed given segment lengths and accel
+                                            # If the segments are short, the toolhead cannot maintain the commanded speed
+                                            v_reach_prev = math.sqrt(max(0.0, 2.0 * a * pl))
+                                            v_reach_cur = math.sqrt(max(0.0, 2.0 * a * v1_len))
+                                            v_in = min(float(pin), v_reach_prev, v_reach_cur)
+                                            # Require a minimum time on both segments to avoid micro-zigzag false positives
+                                            t_prev_seg = pl / float(pin) if (pin and pin > 0) else 0.0
+                                            t_cur_seg = v1_len / float(speed_mms) if (speed_mms and speed_mms > 0) else 0.0
+                                            if (t_prev_seg >= CS_SEG_TIME_MIN_S) and (t_cur_seg >= CS_SEG_TIME_MIN_S):
+                                                # Slightly damp mid-angles for fewer false positives
+                                                angle_factor = abs(math.sin(theta / 2.0)) ** 1.25
+                                                margin = CS_MARGIN  # conservative margin to reduce false positives
+                                                if v_limit is not None and v_limit > 0 and v_in > 0:
+                                                    stress = (v_in / (v_limit * margin)) * angle_factor
+                                                else:
+                                                    # Fallback: acceleration-only heuristic
+                                                    denom = max(1e-3, v_acc)
+                                                    stress = (v_in / (denom * margin)) * angle_factor
+                                                # Suppress very low stress values to reduce noise
+                                                if stress >= CS_STRESS_MIN:
+                                                    heur.corner_samples.append((t_prev_end, float(stress), math.degrees(theta), v_in, v_limit, r_est))
                             # Update previous segment state to current
                             # We need segment time to update end-time; estimate using XY and Z contributions
                             seg_time = 0.0
@@ -862,12 +934,16 @@ class GcodeInspector:
                             # Update cumulative timer
                             self._cum_time_s = t_end
                         # Volumetric flow sample if we can compute time from feed and travel length
-                        # Ignore micro segments to avoid inflated rates from calibration/purge/wipes
-                        if last_feed and xy_dist is not None and xy_dist > 0.5 and delta_e >= 0.05:
+                        # Be permissive so long prints are fully represented; still avoid zero-time spikes.
+                        if last_feed and xy_dist is not None and xy_dist > 0.2 and delta_e >= 0.02:
                             speed_mms = last_feed / 60.0
                             if speed_mms > 0:
-                                t = xy_dist / speed_mms
-                                heur.vol_samples.append((delta_e, t, in_first_layer))
+                                # Floor segment time to avoid divide-by-very-small spikes on tiny moves
+                                t = max(xy_dist / speed_mms, 0.002)
+                                # Store absolute end time so plotting covers travels and skipped micro segments
+                                t_end_abs = float(getattr(self, "_cum_time_s", 0.0))
+                                # Append line number for diagnostics (stored as 5th element; consumers ignore extra fields)
+                                heur.vol_samples.append((delta_e, t, in_first_layer, t_end_abs, line_no))
                     else:
                         # Pure travel or zero E change
                         last_e_move_was_extrude = False
@@ -883,6 +959,71 @@ class GcodeInspector:
                             if not hasattr(self, "_cum_time_s"):
                                 self._cum_time_s = 0.0
                             self._cum_time_s += seg_time
+
+                # Handle arc moves (G2/G3): update position/time/extrusion to avoid mis-attributing flow to next segment
+                if word0 in {"G2", "G3"}:
+                    # Default in case parsing fails
+                    xy_dist_arc = 0.0
+                    # Feedrate update if provided on the arc
+                    f_arc = parse_word(code, "F")
+                    if f_arc is not None:
+                        last_feed = f_arc
+                    x_arc = parse_word(code, "X")
+                    y_arc = parse_word(code, "Y")
+                    e_arc = parse_word(code, "E")
+                    # Estimate chord length from current position to arc endpoint
+                    try:
+                        cur_x = last_x
+                        cur_y = last_y
+                        nx = cur_x if cur_x is not None else 0.0
+                        ny = cur_y if cur_y is not None else 0.0
+                        if absolute_positioning:
+                            if x_arc is not None:
+                                nx = x_arc
+                            if y_arc is not None:
+                                ny = y_arc
+                        else:
+                            nx = (cur_x or 0.0) + (x_arc or 0.0)
+                            ny = (cur_y or 0.0) + (y_arc or 0.0)
+                        if (cur_x is not None) and (cur_y is not None):
+                            dx_a = float(nx) - float(cur_x)
+                            dy_a = float(ny) - float(cur_y)
+                            xy_dist_arc = math.hypot(dx_a, dy_a)
+                        # Update stored position to arc end
+                        last_x = nx
+                        last_y = ny
+                    except Exception:
+                        pass
+                    # Update cumulative time using chord length and current feed
+                    if last_feed is not None and last_feed > 0 and xy_dist_arc > 0.0:
+                        speed_mms = last_feed / 60.0
+                        if speed_mms > 0:
+                            seg_time = xy_dist_arc / speed_mms
+                            if not hasattr(self, "_cum_time_s"):
+                                self._cum_time_s = 0.0
+                            self._cum_time_s += seg_time
+                    # Update extrusion bookeeping so the next line's delta_e is not inflated
+                    if e_arc is not None:
+                        if absolute_extrusion:
+                            delta_e_arc = e_arc - current_e
+                            current_e = e_arc
+                        else:
+                            delta_e_arc = e_arc
+                            current_e += e_arc
+                        if delta_e_arc < -0.01:
+                            seen["RETRACTION"] = True
+                            retraction.samples.append(abs(delta_e_arc))
+                            if last_feed is not None and abs(delta_e_arc) >= 0.25:
+                                retraction.speeds.append(last_feed)
+                            last_e_move_was_extrude = False
+                            retracted_since_last_extrude = True
+                        elif delta_e_arc > 0.0:
+                            extrusion.total_e_mm += delta_e_arc
+                            extrusion.positive_extrusions += 1
+                            last_e_move_was_extrude = True
+                            retracted_since_last_extrude = False
+                    # Use arc distance for subsequent feed classification in this iteration
+                    xy_dist = xy_dist_arc
 
                 # Feed rate classification for move
                 # For extrusion max speed stats, ignore micro-extrusions with tiny XY distance
@@ -929,7 +1070,9 @@ class GcodeInspector:
                                 seg_t += xy_dist / speed_mms
                             if z_dist > 0.0:
                                 seg_t += z_dist / speed_mms
-                            if seg_t > 0.0:
+                            # Ignore skippable timelapse segments in per-layer time metrics
+                            skip_time = in_skippable_block and (current_skip_type == "timelapse")
+                            if seg_t > 0.0 and not skip_time:
                                 heur.layer_time_s[current_layer_index] = heur.layer_time_s.get(current_layer_index, 0.0) + seg_t
                                 # Accumulate fan*time for time-weighted average per layer
                                 heur.layer_fan_time_255[current_layer_index] = heur.layer_fan_time_255.get(current_layer_index, 0.0) + (current_fan_0_255 * seg_t)
@@ -1086,11 +1229,27 @@ class GcodeInspector:
         volume_cm3 = volume_mm3 / 1000.0
         mass_g = volume_cm3 * density
 
+        # Summarize corner stress exceedances for users without matplotlib
+        if heur.corner_samples:
+            try:
+                n_ex = sum(1 for (_, s, *_rest) in heur.corner_samples if float(s) >= 1.0)
+                n_warn = sum(1 for (_, s, *_rest) in heur.corner_samples if 0.8 <= float(s) < 1.0)
+                if n_ex or n_warn:
+                    notes.append(f"Corner stress exceedances (>=1.0): {n_ex}; near-threshold (0.8–1.0): {n_warn}")
+            except Exception:
+                pass
+
         # Compute volumetric flow stats (mm^3/s)
         if heur.vol_samples:
             mm3_s_vals: List[float] = []
             mm3_s_fl_vals: List[float] = []
-            for de, t, fl in heur.vol_samples:
+            for sample in heur.vol_samples:
+                try:
+                    de = float(sample[0])
+                    t = float(sample[1])
+                    fl = bool(sample[2]) if len(sample) >= 3 else False
+                except Exception:
+                    continue
                 if t > 0:
                     rate = (de / t) * cross_section_mm2
                     mm3_s_vals.append(rate)
@@ -1186,6 +1345,17 @@ class GcodeInspector:
                 break
         model_print_time_s = _parse_time_to_seconds(str(header_kv.get("model_printing_time", "")))
         estimated_time_total_s = _parse_time_to_seconds(str(header_kv.get("total_estimated_time", "")))
+        # Fallback: some slicers may not wrap these in a formal header block; try general comment_kv
+        if model_print_time_s is None:
+            try:
+                model_print_time_s = _parse_time_to_seconds(str(comment_kv.get("model_printing_time", "")))
+            except Exception:
+                pass
+        if estimated_time_total_s is None:
+            try:
+                estimated_time_total_s = _parse_time_to_seconds(str(comment_kv.get("total_estimated_time", "")))
+            except Exception:
+                pass
 
         # Chamber temperature from header if available
         def _extract_first_number(obj: object) -> Optional[float]:
@@ -1248,6 +1418,29 @@ class GcodeInspector:
                 first_layer_time_s = heur.layer_time_s.get(0, heur.layer_time_s.get(tkeys[0]))
                 last_layer_time_s = heur.layer_time_s.get(tkeys[-1])
 
+        # Note about timelapse filtering
+        if heur.timelapse_blocks > 0:
+            notes.append(
+                f"Timelapse blocks detected: {heur.timelapse_blocks} (ignored in metrics; {heur.timelapse_lines_skipped} lines skipped)."
+            )
+        # Add slicer time summary to notes for clarity
+        if estimated_time_total_s or model_print_time_s:
+            def _fmt_t(sec: int) -> str:
+                h = sec // 3600
+                m = (sec % 3600) // 60
+                s = sec % 60
+                if h:
+                    return f"{h}h {m}m {s}s"
+                if m:
+                    return f"{m}m {s}s"
+                return f"{s}s"
+            parts = []
+            if estimated_time_total_s:
+                parts.append(f"est total={_fmt_t(int(estimated_time_total_s))}")
+            if model_print_time_s:
+                parts.append(f"model={_fmt_t(int(model_print_time_s))}")
+            notes.append("Slicer time: " + ", ".join(parts))
+
         summary = GcodeSummary(
             file=filename or Path("<stdin>"),
             filament_diameter_mm=self.filament_diameter_mm,
@@ -1284,6 +1477,13 @@ class GcodeInspector:
             first_layer_time_s=first_layer_time_s,
             last_layer_time_s=last_layer_time_s,
         )
+
+        # Record total elapsed time observed during parse for plotting/reference
+        try:
+            if hasattr(self, "_cum_time_s"):
+                summary.heuristics.total_time_s = float(getattr(self, "_cum_time_s", 0.0))
+        except Exception:
+            pass
 
         # Attach slicer estimate summary into notes for now to avoid struct churn
         if any(v is not None for v in (slicer_length_mm, slicer_volume_cm3, slicer_mass_g)):
@@ -1609,7 +1809,7 @@ class GcodeInspector:
         # Volumetric flow checks (mm^3/s)
         def vol_limits(mat: str, printer: Optional[str]) -> Tuple[float, float]:
             m = mat.upper()
-            base = {
+            base_map = {
                 "PLA": (14.0, 22.0),
                 "PETG": (10.0, 16.0),
                 "ABS": (12.0, 18.0),
@@ -1618,19 +1818,32 @@ class GcodeInspector:
                 "NYLON": (12.0, 18.0),
                 "PA": (12.0, 18.0),
                 "PC": (12.0, 18.0),
-            }.get(m, (12.0, 20.0))
-            # Printer/hotend multipliers (conservative)
-            # Special-case H2S with PLA to align with ~25 mm^3/s capability
-            if (printer == "bambu_h2s") and (m == "PLA"):
-                return (22.0, 28.0)
+            }
+            base = base_map.get(m, (12.0, 20.0))
+
+            # Printer/hotend specific caps
+            if printer == "bambu_h2s":
+                # Tuned for H2S 0.4 nozzle: warn/severe guardrails by material.
+                h2s_map = {
+                    "PLA": (22.0, 28.0),
+                    "PETG": (12.0, 18.0),
+                    "ABS": (15.0, 22.0),
+                    "ASA": (14.0, 20.0),
+                    "PC": (12.0, 18.0),
+                    "NYLON": (12.0, 18.0),
+                    "PA": (12.0, 18.0),
+                    "TPU": (6.0, 9.0),
+                }
+                # Use modest uplift for unknowns
+                return h2s_map.get(m, (base[0] * 1.2, base[1] * 1.2))
+
+            # Generic multipliers for other printers (conservative)
             mult = {
                 None: 1.0,
                 "bambu_a1": 1.0,
                 "bambu_p1s": 1.1,
                 "bambu_x1c": 1.2,
                 "bambu_h2d": 1.2,
-                # H2S is high-flow; moderately raise generic limits
-                "bambu_h2s": 1.4,
             }.get(printer, 1.0)
             return base[0] * mult, base[1] * mult
 
@@ -1653,16 +1866,29 @@ class GcodeInspector:
                 pass
         # First-layer volumetric threshold scaled by printer capability
         if heur.max_volumetric_first_layer_mm3_s is not None:
-            # Reuse the same multiplier logic as vol_limits()
-            mult = {
-                None: 1.0,
-                "bambu_a1": 1.0,
-                "bambu_p1s": 1.1,
-                "bambu_x1c": 1.2,
-                "bambu_h2d": 1.2,
-                "bambu_h2s": 1.4,
-            }.get(heur.printer_model, 1.0)
-            first_layer_warn = 12.0 * mult
+            if heur.printer_model == "bambu_h2s":
+                # Tuned per-material first-layer caution thresholds for H2S
+                fl_map = {
+                    "PLA": 16.0,
+                    "PETG": 9.0,
+                    "ABS": 12.0,
+                    "ASA": 12.0,
+                    "PC": 11.0,
+                    "NYLON": 11.0,
+                    "PA": 11.0,
+                    "TPU": 7.0,
+                }
+                first_layer_warn = fl_map.get(material.upper(), 12.0)
+            else:
+                # Reuse generic multipliers for others
+                mult = {
+                    None: 1.0,
+                    "bambu_a1": 1.0,
+                    "bambu_p1s": 1.1,
+                    "bambu_x1c": 1.2,
+                    "bambu_h2d": 1.2,
+                }.get(heur.printer_model, 1.0)
+                first_layer_warn = 12.0 * mult
             if heur.max_volumetric_first_layer_mm3_s > first_layer_warn:
                 flags.append("First-layer volumetric flow high; reduce speed or increase temp/line width.")
 
@@ -1704,6 +1930,13 @@ def print_report(summary: GcodeSummary) -> None:
             print(f"- Est. total time: {_fmt_time(summary.estimated_time_total_s)}")
         if summary.model_print_time_s is not None:
             print(f"- Model time: {_fmt_time(summary.model_print_time_s)}")
+        # Also show naive integrated time from G-code distances/feeds (typically underestimates actual time)
+        try:
+            t_obs = int(float(getattr(summary.heuristics, 'total_time_s', 0.0)))
+        except Exception:
+            t_obs = 0
+        if t_obs > 0:
+            print(f"- Observed time (integrated): {_fmt_time(t_obs)}")
         if summary.total_layers is not None:
             print(f"- Layers: {summary.total_layers}")
         if summary.max_z_height_mm is not None:
@@ -1796,7 +2029,7 @@ def print_report(summary: GcodeSummary) -> None:
             med = _median(xs)
             dev = [abs(x - med) for x in xs]
             return _median(dev)
-        def _sig_jumps(keys: List[int], vals: List[float], abs_floor: float, pct_min: float, sigma_k: float = 3.0, min_baseline: float = 5.0) -> List[str]:
+        def _sig_jumps(keys: List[int], vals: List[float], abs_floor: float, pct_min: float, sigma_k: float, min_baseline: float, skip_first_n: int = 2) -> List[str]:
             if len(keys) < 2:
                 return []
             diffs: List[float] = []
@@ -1807,6 +2040,9 @@ def print_report(summary: GcodeSummary) -> None:
             scale = mad * 1.4826 if mad > 0 else 0.0
             out: List[str] = []
             for i in range(1, len(keys)):
+                # Skip very early layers where startup behavior is noisy
+                if i <= skip_first_n:
+                    continue
                 a, b = vals[i-1], vals[i]
                 d = b - a
                 if a <= min_baseline:
@@ -1815,7 +2051,15 @@ def print_report(summary: GcodeSummary) -> None:
                 z_ok = (scale > 0 and abs(d - med) >= sigma_k * scale)
                 abs_ok = abs(d) >= abs_floor
                 pct_ok = p >= pct_min
-                if (z_ok or abs_ok) and pct_ok:
+                # Oscillation filter: if the next diff reverses sign with similar magnitude, ignore
+                if i < len(keys) - 1:
+                    next_d = vals[i+1] - vals[i]
+                    if (d > 0 and next_d < 0) or (d < 0 and next_d > 0):
+                        if abs(next_d) >= 0.6 * abs(d):
+                            continue
+                # Require robust deviation and percent; or a strong absolute+percent change
+                strong_abs = abs_ok and abs(d) >= 1.5 * abs_floor
+                if (z_ok and pct_ok) or (strong_abs and pct_ok):
                     out.append((i, d, p))
             # Format top 10 by absolute delta
             out_sorted = sorted(out, key=lambda t: abs(t[1]), reverse=True)[:10]
@@ -1830,7 +2074,14 @@ def print_report(summary: GcodeSummary) -> None:
             m_keys = sorted(lm.keys())
             m_vals = [lm[k] for k in m_keys]
             m_med = _median(m_vals)
-            mv_lines = _sig_jumps(m_keys, m_vals, abs_floor=max(0.08 * m_med, 60.0), pct_min=35.0)
+            mv_lines = _sig_jumps(
+                m_keys,
+                m_vals,
+                abs_floor=max(LM_ABS_FLOOR_MM_FACTOR * m_med, LM_ABS_FLOOR_MM_MIN),
+                pct_min=LM_PCT_MIN,
+                sigma_k=LM_SIGMA_K,
+                min_baseline=LM_MIN_BASELINE_MM,
+            )
             if mv_lines:
                 print("- Significant movement jumps:")
                 for s in mv_lines:
@@ -1840,7 +2091,14 @@ def print_report(summary: GcodeSummary) -> None:
             t_vals = [lt[k] for k in t_keys]
             t_med = _median(t_vals)
             # Time is in seconds
-            t_lines = _sig_jumps(t_keys, t_vals, abs_floor=max(0.12 * t_med, 12.0), pct_min=35.0)
+            t_lines = _sig_jumps(
+                t_keys,
+                t_vals,
+                abs_floor=max(LT_ABS_FLOOR_S_FACTOR * t_med, LT_ABS_FLOOR_S_MIN),
+                pct_min=LT_PCT_MIN,
+                sigma_k=LT_SIGMA_K,
+                min_baseline=LT_MIN_BASELINE_S,
+            )
             if t_lines:
                 print("- Significant time jumps:")
                 for s in t_lines:
@@ -2470,23 +2728,45 @@ def _flow_safe_limits(material: str, printer: Optional[str] = None, mvs_override
         return low, high
     m = (material or "").upper()
     p = (printer or "").lower() if printer else None
-    # Printer-specific adjustments
-    if p == "bambu_h2s" and "PLA" in m:
-        # High-flow H2S with PLA: typical safe limit around 25 mm^3/s
-        return 18.0, 25.0
-    # Material defaults (conservative)
+
+    # Printer-specific adjustments: tuned H2S bands by material (safe shading band)
+    if p == "bambu_h2s":
+        if "PLA" in m:
+            return 18.0, 25.0
+        if "PETG" in m:
+            return 9.0, 13.0
+        if ("ABS" in m) or ("ASA" in m):
+            return 11.0, 16.0
+        if ("PA" in m) or ("NYLON" in m):
+            return 10.0, 14.0
+        if "PC" in m:
+            return 10.0, 14.0
+        if "TPU" in m:
+            return 6.0, 8.0
+        # Default modest uplift for unknowns
+        return 8.0, 12.0
+
+    # Material defaults (conservative) for non-H2S
     if "PETG" in m:
         return 6.0, 9.0
     if "ABS" in m or "ASA" in m:
         return 8.0, 12.0
     if "PLA" in m:
         return 8.0, 12.0
+    if ("PA" in m) or ("NYLON" in m):
+        return 8.0, 12.0
+    if "PC" in m:
+        return 8.0, 12.0
     # Default conservative range
     return 6.0, 10.0
 
 
 def _plot_volumetric_flow(summary: GcodeSummary, out_path: Optional[Path] = None) -> Optional[Path]:
-    """Volumetric flow (mm^3/s) vs time; returns Path or None."""
+    """Volumetric flow (mm^3/s) vs time; returns Path or None.
+
+    For long prints, splits the timeline into 15-minute windows so later
+    intervals are visible rather than only the first segment.
+    """
     heur = summary.heuristics
     if not heur or not heur.vol_samples:
         return None
@@ -2495,33 +2775,96 @@ def _plot_volumetric_flow(summary: GcodeSummary, out_path: Optional[Path] = None
         summary.notes.append("Matplotlib not available; skipping flow plot.")
         return None
 
-    # Compute per-segment flow rates and cumulative time
+    # Compute per-segment flow inputs (de, t, t_abs) then lightly condense by time-binning
     radius_mm = summary.filament_diameter_mm / 2.0
     area_mm2 = math.pi * radius_mm * radius_mm
-    flows: List[float] = []
-    times_s: List[float] = []
+    segs: List[Tuple[float, float, float]] = []  # (de, t, t_abs)
     cum = 0.0
-    over_count = 0
-    low, high = _flow_safe_limits(summary.inferred_material, summary.printer_model, summary.filament_mvs_mm3_s)
-    # Use a tolerance to avoid flagging tiny numeric overshoots
-    tol = max(0.5, high * 0.05) if high else 0.5
-    for de, t, _fl in heur.vol_samples:
+    for sample in heur.vol_samples:
+        try:
+            de = float(sample[0])
+            t = float(sample[1])
+        except Exception:
+            continue
         if t <= 0:
             continue
-        rate = (de / t) * area_mm2  # mm^3/s
-        flows.append(rate)
-        cum += t
-        times_s.append(cum)
-        if high and rate > (high + tol):
-            over_count += 1
+        # Prefer absolute end time if provided (index 3)
+        t_abs: Optional[float] = None
+        if len(sample) >= 4:
+            try:
+                t_abs = float(sample[3])
+            except Exception:
+                t_abs = None
+        if t_abs is None or t_abs < 0:
+            cum += t
+            t_abs = cum
+        segs.append((de, t, t_abs))
+
+    if not segs:
+        return None
+
+    # Condense adjacent samples into small time windows to reduce noise/point count
+    # Keep bins modest so peak detection still works; 50 ms works well for typical F values
+    BIN_S = 0.050
+    flows: List[float] = []
+    times_s: List[float] = []
+    over_count = 0
+    low, high = _flow_safe_limits(summary.inferred_material, summary.printer_model, summary.filament_mvs_mm3_s)
+    tol = max(0.5, high * 0.05) if high else 0.5
+
+    if segs:
+        # Ensure chronological order by t_abs (defensive)
+        segs.sort(key=lambda x: x[2])
+        bin_start = segs[0][2]
+        acc_de = 0.0
+        acc_t = 0.0
+        last_t_abs = segs[0][2]
+        for de, t, t_abs in segs:
+            # Flush bin if we've crossed BIN_S in absolute time
+            if (t_abs - bin_start) >= BIN_S and acc_t > 0.0:
+                rate = (acc_de / acc_t) * area_mm2
+                flows.append(rate)
+                times_s.append(last_t_abs)
+                if high and rate > (high + tol):
+                    over_count += 1
+                # Reset bin
+                bin_start = t_abs
+                acc_de = 0.0
+                acc_t = 0.0
+            # Accumulate current segment
+            acc_de += de
+            acc_t += t
+            last_t_abs = t_abs
+        # Flush any remainder
+        if acc_t > 0.0:
+            rate = (acc_de / acc_t) * area_mm2
+            flows.append(rate)
+            times_s.append(last_t_abs)
+            if high and rate > (high + tol):
+                over_count += 1
 
     if not flows:
         return None
 
+    # Optionally scale the absolute time axis to slicer's model/estimated time to better match reality
+    target_time_s = None
+    try:
+        if getattr(summary, 'model_print_time_s', None):
+            target_time_s = float(summary.model_print_time_s)
+        elif getattr(summary, 'estimated_time_total_s', None):
+            target_time_s = float(summary.estimated_time_total_s)
+    except Exception:
+        target_time_s = None
+    if target_time_s and times_s:
+        observed_end = max(times_s)
+        # Only stretch if the slicer time is meaningfully larger than our naive integration
+        if observed_end > 0 and target_time_s > observed_end * 1.15:
+            scale = target_time_s / observed_end
+            times_s = [t * scale for t in times_s]
+
     t_min = [v / 60.0 for v in times_s]
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(t_min, flows, color="#1f77b4", linewidth=0.6, alpha=0.6, label="Flow (mm³/s)")
-    # Rolling mean smoothing (~1% of samples, bounded)
+    # Prepare smoothing once so we can reuse per window
+    smooth = None
     n = len(flows)
     if n >= 5:
         w = max(10, min(1000, max(1, int(n * 0.01))))
@@ -2534,29 +2877,105 @@ def _plot_volumetric_flow(summary: GcodeSummary, out_path: Optional[Path] = None
             k = i1 - i0
             return (csum[i1] - csum[i0]) / max(1, k)
         smooth = [rmean(i) for i in range(n)]
-        ax.plot(t_min, smooth, color="#2ca02c", linewidth=1.4, label=f"Rolling mean (w={w})")
-    ax.set_xlabel("Time (min)")
-    ax.set_ylabel("Flow (mm³/s)")
-    ax.grid(True, alpha=0.3)
 
-    # Safe range shading and threshold line
-    ax.axhspan(low, high, color="#2ca02c", alpha=0.12, label=f"Safe {low:.0f}–{high:.0f}")
-    ax.axhline(high, color="#d62728", linestyle="--", linewidth=1.0, label=f"Limit {high:.0f}")
-    # Mark exceedances
-    if high:
-        exceed_x = [tm for tm, fv in zip(t_min, flows) if fv > (high + tol)]
-        exceed_y = [fv for fv in flows if fv > (high + tol)]
-        if exceed_x:
-            ax.scatter(exceed_x, exceed_y, s=12, color="#d62728", alpha=0.9, marker="x", label="Exceedances")
+    # If duration exceeds 1 hour, write multiple PNG segments (one per hour) for readability
+    # Use observed end of print if larger than last sample time
+    total_min = t_min[-1]
+    try:
+        # Prefer scaled/slicer time if present
+        if target_time_s:
+            total_min = max(total_min, float(target_time_s) / 60.0)
+        elif hasattr(heur, 'total_time_s') and heur.total_time_s:
+            total_min = max(total_min, float(heur.total_time_s) / 60.0)
+    except Exception:
+        pass
+    # If duration exceeds 15 minutes, split into subplots within one figure
+    window_min = 15.0
+    if total_min > window_min + 1e-6:
+        import math as _math
+        windows = int(_math.ceil(total_min / window_min))
+        fig, axes = plt.subplots(windows, 1, figsize=(12, max(5, 3.6 * windows)), sharey=True)
+        # Matplotlib returns a numpy.ndarray of axes when windows>1; flatten safely
+        try:
+            axes = axes.ravel().tolist()  # type: ignore[attr-defined]
+        except Exception:
+            axes = list(axes) if isinstance(axes, (list, tuple)) else [axes]
+        # Plot each 15-minute window into its own axis
+        for i, ax in enumerate(axes):
+            start = i * window_min
+            end = min((i + 1) * window_min, total_min)
+            mask = [(tm >= start) and (tm <= end if i == windows - 1 else tm < end) for tm in t_min]
+            x = [tm for tm, m in zip(t_min, mask) if m]
+            y = [fv for fv, m in zip(flows, mask) if m]
+            if not x:
+                # Still draw safe region to keep axis sizing
+                ax.set_xlim(start, end)
+                ax.set_ylabel("Flow (mm³/s)")
+                ax.grid(True, alpha=0.3)
+                ax.axhspan(low, high, color="#2ca02c", alpha=0.12)
+                ax.axhline(high, color="#d62728", linestyle="--", linewidth=1.0)
+                if i == windows - 1:
+                    ax.set_xlabel("Time (min)")
+                continue
+            ax.plot(x, y, color="#1f77b4", linewidth=0.6, alpha=0.6)
+            if smooth is not None:
+                y2 = [sv for sv, m in zip(smooth, mask) if m]
+                if y2:
+                    ax.plot(x, y2, color="#2ca02c", linewidth=1.2)
+            ax.set_xlim(start, end)
+            ax.set_ylabel("Flow (mm³/s)")
+            ax.grid(True, alpha=0.3)
+            # Safe band and limit
+            ax.axhspan(low, high, color="#2ca02c", alpha=0.12)
+            ax.axhline(high, color="#d62728", linestyle="--", linewidth=1.0)
+            # Exceedances in this window
+            if high:
+                ex_x = [tm for tm, fv, m in zip(t_min, flows, mask) if m and fv > (high + tol)]
+                ex_y = [fv for fv, m in zip(flows, mask) if m and fv > (high + tol)]
+                if ex_x:
+                    ax.scatter(ex_x, ex_y, s=12, color="#d62728", alpha=0.9, marker="x")
+            # Only label x-axis on last subplot to reduce clutter
+            if i == windows - 1:
+                ax.set_xlabel("Time (min)")
 
-    ax.legend(loc="upper right")
-    _apply_plot_style(fig,
-                      title="Volumetric Flow (mm³/s)",
-                      subtitle=_plot_subtitle(summary),
-                      caption=(
-                          "Green band = typical safe range; dashed = limit; red × = exceedances.\n"
-                          "Above-limit flow risks under-extrusion/matte bands/weaker parts; use to set safe speeds/widths."
-                      ))
+        # Apply common title/caption styling
+        _apply_plot_style(
+            fig,
+            title="Volumetric Flow (mm³/s)",
+            subtitle=_plot_subtitle(summary),
+            caption=(
+                "Split into 15-minute windows. Green band = typical safe range; dashed = limit; red × = exceedances.\n"
+                "Above-limit flow risks under-extrusion/matte bands/weaker parts; use to set safe speeds/widths."
+            ),
+        )
+    else:
+        # Single-axes plot (short prints)
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(t_min, flows, color="#1f77b4", linewidth=0.6, alpha=0.6, label="Flow (mm³/s)")
+        if smooth is not None:
+            ax.plot(t_min, smooth, color="#2ca02c", linewidth=1.4, label="Rolling mean")
+        ax.set_xlabel("Time (min)")
+        ax.set_ylabel("Flow (mm³/s)")
+        ax.grid(True, alpha=0.3)
+        # Safe range shading and threshold line
+        ax.axhspan(low, high, color="#2ca02c", alpha=0.12, label=f"Safe {low:.0f}–{high:.0f}")
+        ax.axhline(high, color="#d62728", linestyle="--", linewidth=1.0, label=f"Limit {high:.0f}")
+        # Mark exceedances
+        if high:
+            exceed_x = [tm for tm, fv in zip(t_min, flows) if fv > (high + tol)]
+            exceed_y = [fv for fv in flows if fv > (high + tol)]
+            if exceed_x:
+                ax.scatter(exceed_x, exceed_y, s=12, color="#d62728", alpha=0.9, marker="x", label="Exceedances")
+        ax.legend(loc="upper right")
+        _apply_plot_style(
+            fig,
+            title="Volumetric Flow (mm³/s)",
+            subtitle=_plot_subtitle(summary),
+            caption=(
+                "Green band = typical safe range; dashed = limit; red × = exceedances.\n"
+                "Above-limit flow risks under-extrusion/matte bands/weaker parts; use to set safe speeds/widths."
+            ),
+        )
 
     if out_path is None:
         out_path = summary.file.with_suffix('.flow.png')
@@ -2582,6 +3001,23 @@ def _ensure_matplotlib():  # returns pyplot module or None
     except Exception:
         # Try a one-time install
         if _MPL_TRIED_INSTALL:
+            return None
+        _MPL_TRIED_INSTALL = True
+        try:
+            import subprocess, sys, importlib
+            # Best-effort user install without polluting system site-packages
+            cmd = [sys.executable, "-m", "pip", "install", "--user", "matplotlib"]
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Re-try import
+            importlib.invalidate_caches()
+            import matplotlib
+            try:
+                matplotlib.use("Agg", force=True)
+            except Exception:
+                pass
+            import matplotlib.pyplot as plt  # type: ignore
+            return plt
+        except Exception:
             return None
 
 
@@ -2627,6 +3063,32 @@ def _plot_subtitle(summary: GcodeSummary) -> str:
                 layers = max(keys) + 1
     if layers:
         parts.append(f"Layers: {layers}")
+    # Slicer time (estimated/model) if available
+    try:
+        et = summary.estimated_time_total_s
+        mt = summary.model_print_time_s
+        def _fmt_t(sec: Optional[int]) -> Optional[str]:
+            if sec is None:
+                return None
+            h = int(sec) // 3600
+            m = (int(sec) % 3600) // 60
+            s = int(sec) % 60
+            if h:
+                return f"{h}h {m}m {s}s"
+            if m:
+                return f"{m}m {s}s"
+            return f"{s}s"
+        et_str = _fmt_t(et)
+        mt_str = _fmt_t(mt)
+        if et_str or mt_str:
+            if et_str and mt_str:
+                parts.append(f"Slicer: est {et_str}, model {mt_str}")
+            elif et_str:
+                parts.append(f"Slicer: est {et_str}")
+            elif mt_str:
+                parts.append(f"Slicer: model {mt_str}")
+    except Exception:
+        pass
     return " • ".join(parts)
 
 
@@ -2668,24 +3130,6 @@ def _apply_plot_style(fig, title: str, subtitle: Optional[str] = None, caption: 
         fig.tight_layout(rect=[0, 0.07, 1, 0.92])
     except Exception:
         pass
-        _MPL_TRIED_INSTALL = True
-        try:
-            import subprocess, sys
-            # Best-effort user install without polluting system site-packages
-            cmd = [sys.executable, "-m", "pip", "install", "--user", "matplotlib"]
-            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # Re-try import
-            import importlib
-            importlib.invalidate_caches()
-            import matplotlib
-            try:
-                matplotlib.use("Agg", force=True)
-            except Exception:
-                pass
-            import matplotlib.pyplot as plt  # type: ignore
-            return plt
-        except Exception:
-            return None
 
 
 def _gcode_file_list_from_arg(path: Path, recursive: bool = False) -> List[Path]:
@@ -3181,8 +3625,29 @@ def main(argv: List[str]) -> int:
             if used_dialog and not no_hold:
                 _final_hold()
         # If launched via options dialog (used_dialog True) and we suppressed the post prompt,
-        # show a standard "press any key" hold to allow reading the output.
+        # show a simple GUI summary of any plots saved, then hold the window.
         elif used_dialog and not show_post_prompt:
+            try:
+                import tkinter as tk  # type: ignore
+                from tkinter import messagebox  # type: ignore
+                root = tk.Tk(); root.withdraw()
+                saved_msgs: List[str] = []
+                if plot and target.with_suffix('.layer_metrics.png').exists():
+                    saved_msgs.append(f"Layer metrics → {target.with_suffix('.layer_metrics.png').name}")
+                if flow_plot and target.with_suffix('.flow.png').exists():
+                    saved_msgs.append(f"Volumetric flow → {target.with_suffix('.flow.png').name}")
+                if e_per_mm_plot and target.with_suffix('.e_per_mm.png').exists():
+                    saved_msgs.append(f"E/mm → {target.with_suffix('.e_per_mm.png').name}")
+                if corner_stress_plot and target.with_suffix('.corner_stress.png').exists():
+                    saved_msgs.append(f"Corner stress → {target.with_suffix('.corner_stress.png').name}")
+                if cooling_plot and target.with_suffix('.cooling.png').exists():
+                    saved_msgs.append(f"Cooling → {target.with_suffix('.cooling.png').name}")
+                if saved_msgs:
+                    messagebox.showinfo("G-code Inspector", "Saved plots:\n\n" + "\n".join(saved_msgs))
+                else:
+                    messagebox.showinfo("G-code Inspector", "Done.")
+            except Exception:
+                pass
             _final_hold()
         # If launched by drag-and-drop onto .py (no picker, no --interactive), the console window
         # may close immediately; add a final hold when not attached to a TTY.
